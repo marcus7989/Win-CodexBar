@@ -234,6 +234,42 @@ impl GeminiApi {
         let base_dir = resolved.parent()?;
 
         Self::oauth_credentials_from_candidates(Self::binary_oauth_candidates(base_dir))
+            .or_else(|| Self::bundled_cli_oauth_credentials(base_dir))
+    }
+
+    /// Recent Gemini CLI releases ship as a single esbuild bundle
+    /// (`node_modules/@google/gemini-cli/bundle/*.js`) without the separate
+    /// `gemini-cli-core/dist` tree, so scan the bundle chunks for the OAuth
+    /// client constants instead.
+    fn bundled_cli_oauth_credentials(base_dir: &Path) -> Option<OAuthClientCredentials> {
+        let bundle_roots = [
+            base_dir
+                .join("..")
+                .join("node_modules")
+                .join("@google")
+                .join("gemini-cli")
+                .join("bundle"),
+            base_dir
+                .join("node_modules")
+                .join("@google")
+                .join("gemini-cli")
+                .join("bundle"),
+        ];
+        for bundle_dir in bundle_roots {
+            let Ok(entries) = std::fs::read_dir(&bundle_dir) else {
+                continue;
+            };
+            let mut chunks: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "js"))
+                .collect();
+            chunks.sort();
+            if let Some(creds) = Self::oauth_credentials_from_candidates(chunks) {
+                return Some(creds);
+            }
+        }
+        None
     }
 
     fn oauth_credentials_from_candidates<I>(candidates: I) -> Option<OAuthClientCredentials>
@@ -678,6 +714,38 @@ fn jwt_payload(token: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_cli_layout_yields_oauth_client_credentials() {
+        // npm global layout on Windows: %APPDATA%\npm\gemini.cmd next to
+        // node_modules\@google\gemini-cli\bundle\chunk-*.js (no gemini-cli-core/dist).
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path();
+        let bundle = bin_dir
+            .join("node_modules")
+            .join("@google")
+            .join("gemini-cli")
+            .join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("chunk-AAA.js"), "var x = 1;").unwrap();
+        std::fs::write(
+            bundle.join("chunk-BBB.js"),
+            r#"var OAUTH_CLIENT_ID = "id-123.apps.googleusercontent.com"; var OAUTH_CLIENT_SECRET = 'secret-xyz';"#,
+        )
+        .unwrap();
+
+        assert!(
+            GeminiApi::oauth_credentials_from_candidates(
+                GeminiApi::binary_oauth_candidates(bin_dir)
+            )
+            .is_none(),
+            "legacy dist layout must not match"
+        );
+        let creds = GeminiApi::bundled_cli_oauth_credentials(bin_dir)
+            .expect("bundle chunks should be scanned");
+        assert_eq!(creds.client_id, "id-123.apps.googleusercontent.com");
+        assert_eq!(creds.client_secret, "secret-xyz");
+    }
 
     #[test]
     fn paid_tier_name_overrides_generic_tier_fallbacks() {
