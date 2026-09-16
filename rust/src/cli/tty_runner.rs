@@ -69,6 +69,13 @@ pub struct TtyCommandOptions {
     pub stop_on_substrings: Vec<String>,
     /// Settle time after stopping (default: 0.25s)
     pub settle_after_stop_secs: f64,
+    /// Re-send the script at these offsets (seconds since launch) while none
+    /// of `script_done_substrings` has appeared in the output yet. Interactive
+    /// CLIs such as Claude Code drop keystrokes that arrive before their input
+    /// widget is mounted, and that readiness delay varies between machines.
+    pub script_retry_delays_secs: Vec<f64>,
+    /// Case-insensitive markers that show the script was accepted (stops retries).
+    pub script_done_substrings: Vec<String>,
     /// Environment variables to set
     pub env: HashMap<String, String>,
 }
@@ -90,6 +97,8 @@ impl Default for TtyCommandOptions {
             stop_on_url: false,
             stop_on_substrings: Vec::new(),
             settle_after_stop_secs: 0.25,
+            script_retry_delays_secs: Vec::new(),
+            script_done_substrings: Vec::new(),
             env: HashMap::new(),
         }
     }
@@ -142,6 +151,19 @@ impl TtyCommandOptions {
 
     pub fn with_stop_on_substring(mut self, substring: impl Into<String>) -> Self {
         self.stop_on_substrings.push(substring.into());
+        self
+    }
+
+    pub fn with_script_retries(
+        mut self,
+        delays_secs: Vec<f64>,
+        done_substrings: Vec<String>,
+    ) -> Self {
+        self.script_retry_delays_secs = delays_secs;
+        self.script_done_substrings = done_substrings
+            .into_iter()
+            .map(|marker| marker.to_lowercase())
+            .collect();
         self
     }
 
@@ -359,27 +381,15 @@ impl TtyCommandRunner {
             .map(str::trim_end)
             .filter(|line| !line.trim().is_empty())
             .collect();
-        for (idx, line) in script_lines.iter().enumerate() {
-            if options.script_char_delay_secs > 0.0 {
-                for ch in line.chars() {
-                    // Best-effort scripted input; a closed PTY just drops the write.
-                    let _typed = write!(writer, "{}", ch);
-                    // Best-effort flush; failures surface only as missing script output.
-                    let _flushed = writer.flush();
-                    std::thread::sleep(Duration::from_secs_f64(options.script_char_delay_secs));
-                }
-                // Best-effort line terminator; interactive programs expect CRLF.
-                let _newline_written = write!(writer, "\r\n");
-            } else {
-                // Best-effort whole-line write for the no-delay path.
-                let _line_written = write!(writer, "{}\r\n", line);
-            }
-            // Best-effort flush per script line.
-            let _line_flushed = writer.flush();
-            if idx + 1 < script_lines.len() && options.script_line_delay_secs > 0.0 {
-                std::thread::sleep(Duration::from_secs_f64(options.script_line_delay_secs));
-            }
-        }
+        write_script_lines(&mut writer, &script_lines, options);
+        let mut pending_script_retries: Vec<Duration> = options
+            .script_retry_delays_secs
+            .iter()
+            .map(|secs| Duration::from_secs_f64(*secs))
+            .collect();
+        pending_script_retries.sort();
+        let mut next_script_retry = pending_script_retries.into_iter();
+        let mut upcoming_script_retry = next_script_retry.next();
 
         let mut last_enter = Instant::now();
 
@@ -486,6 +496,17 @@ impl TtyCommandRunner {
 
             if stopped_early {
                 break;
+            }
+
+            // Re-send the script while the target program has not shown that it
+            // accepted the first attempt (input widget mounted late).
+            if let Some(retry_at) = upcoming_script_retry
+                && start.elapsed() >= retry_at
+            {
+                upcoming_script_retry = next_script_retry.next();
+                if !script_lines.is_empty() && !script_accepted(&buffer, options) {
+                    write_script_lines(&mut writer, &script_lines, options);
+                }
             }
 
             // Send periodic enters if configured
@@ -630,9 +651,63 @@ impl RollingBuffer {
     }
 }
 
+/// Type the script lines into the PTY, honouring the configured delays.
+fn write_script_lines(
+    writer: &mut Box<dyn Write + Send>,
+    script_lines: &[&str],
+    options: &TtyCommandOptions,
+) {
+    for (idx, line) in script_lines.iter().enumerate() {
+        if options.script_char_delay_secs > 0.0 {
+            for ch in line.chars() {
+                // Best-effort scripted input; a closed PTY just drops the write.
+                let _typed = write!(writer, "{}", ch);
+                // Best-effort flush; failures surface only as missing script output.
+                let _flushed = writer.flush();
+                std::thread::sleep(Duration::from_secs_f64(options.script_char_delay_secs));
+            }
+            // Best-effort line terminator; interactive programs expect CRLF.
+            let _newline_written = write!(writer, "\r\n");
+        } else {
+            // Best-effort whole-line write for the no-delay path.
+            let _line_written = write!(writer, "{}\r\n", line);
+        }
+        // Best-effort flush per script line.
+        let _line_flushed = writer.flush();
+        if idx + 1 < script_lines.len() && options.script_line_delay_secs > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(options.script_line_delay_secs));
+        }
+    }
+}
+
+/// True once any configured done marker is visible in the (ANSI-stripped) output.
+fn script_accepted(buffer: &str, options: &TtyCommandOptions) -> bool {
+    if options.script_done_substrings.is_empty() {
+        return false;
+    }
+    let ansi = Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").ok();
+    let clean = ansi
+        .map(|re| re.replace_all(buffer, "").to_string())
+        .unwrap_or_else(|| buffer.to_string())
+        .to_lowercase();
+    options
+        .script_done_substrings
+        .iter()
+        .any(|marker| clean.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_accepted_matches_markers_case_insensitively_through_ansi() {
+        let opts = TtyCommandOptions::new()
+            .with_script_retries(vec![1.0], vec!["Current session".to_string()]);
+        assert!(script_accepted("\x1b[1mCURRENT\x1b[0m session 12% used", &opts));
+        assert!(!script_accepted("Try \"fix lint errors\"", &opts));
+        assert!(!script_accepted("Current session", &TtyCommandOptions::new()));
+    }
 
     #[test]
     fn test_tty_options_builder() {
