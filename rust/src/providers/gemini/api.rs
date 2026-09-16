@@ -735,9 +735,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            GeminiApi::oauth_credentials_from_candidates(
-                GeminiApi::binary_oauth_candidates(bin_dir)
-            )
+            GeminiApi::oauth_credentials_from_candidates(GeminiApi::binary_oauth_candidates(
+                bin_dir
+            ))
             .is_none(),
             "legacy dist layout must not match"
         );
