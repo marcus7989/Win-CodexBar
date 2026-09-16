@@ -431,6 +431,7 @@ enum ServeRoute {
     Health,
     Usage {
         provider: Option<String>,
+        source: Option<String>,
     },
     Cost {
         provider: Option<String>,
@@ -441,10 +442,11 @@ enum ServeRoute {
 
 fn resolve_route(request: &ServeRequest) -> Option<ServeRoute> {
     let provider = request.query.get("provider").cloned();
+    let source = request.query.get("source").cloned();
     match request.path.as_str() {
         "/" => Some(ServeRoute::DashboardHome),
         "/health" => Some(ServeRoute::Health),
-        "/usage" => Some(ServeRoute::Usage { provider }),
+        "/usage" => Some(ServeRoute::Usage { provider, source }),
         "/cost" => Some(ServeRoute::Cost { provider }),
         "/dashboard/v1/snapshot" => Some(ServeRoute::DashboardSnapshot),
         path if path.starts_with("/icons/") && path.ends_with(".svg") => {
@@ -496,14 +498,14 @@ async fn route_request(request: &ServeRequest, config: &ServeConfig) -> String {
             200,
             serde_json::json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }),
         ),
-        ServeRoute::Usage { provider } => {
+        ServeRoute::Usage { provider, source } => {
             if !authorize_request(
                 request.authorization.as_deref(),
                 config.token_digest.as_ref(),
             ) {
                 return unauthorized_response();
             }
-            data::usage_response(provider.as_deref()).await
+            data::usage_response(provider.as_deref(), source.as_deref()).await
         }
         ServeRoute::Cost { provider } => {
             if !authorize_request(

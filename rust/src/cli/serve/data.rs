@@ -12,15 +12,26 @@ use crate::cost_scanner::{self, CostScanner};
 
 use super::json_response;
 
-pub async fn usage_response(provider: Option<&str>) -> String {
+pub async fn usage_response(provider: Option<&str>, source: Option<&str>) -> String {
     let selection = match ProviderSelection::from_arg(provider) {
         Ok(selection) => selection,
         Err(error) => {
             return json_response(400, json!({ "error": error.to_string() }));
         }
     };
+    // Optional `source=auto|oauth|web|cli` lets a client (or a test bench) pin
+    // one fetch path instead of the auto cascade.
+    let source_mode = match source {
+        None => SourceMode::Auto,
+        Some(raw) => match SourceMode::parse(raw) {
+            Some(mode) => mode,
+            None => {
+                return json_response(400, json!({ "error": format!("unknown source: {raw}") }));
+            }
+        },
+    };
     let ctx = FetchContext {
-        source_mode: SourceMode::Auto,
+        source_mode,
         include_credits: true,
         web_timeout: 60,
         verbose: false,

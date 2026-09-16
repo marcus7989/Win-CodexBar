@@ -664,7 +664,8 @@ fn resolve_route_maps_paths() {
     assert_eq!(
         resolve_route(&req("/usage?provider=codex", &[])),
         Some(ServeRoute::Usage {
-            provider: Some("codex".to_string())
+            provider: Some("codex".to_string()),
+            source: None,
         })
     );
     assert_eq!(
