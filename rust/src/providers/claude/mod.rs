@@ -101,6 +101,13 @@ pub const CLOUDFLARE_CHALLENGE_MESSAGE: &str = concat!(
     "(Usage credits balance will be unavailable), or try a different network."
 );
 
+/// Stable marker appended to the Auto-mode failure summary when the OAuth
+/// usage endpoint refused the request (rate limited) while no claude.ai
+/// browser cookies were readable and the CLI probe also failed. Claude Code
+/// is signed in in that situation; what is missing is a browser session.
+/// Companion apps match this token instead of parsing the English summary.
+pub const CLAUDE_BROWSER_SIGN_IN_MARKER: &str = "[claude:browser-sign-in-required]";
+
 /// Whether the user explicitly consented to reading (and refreshing) Claude
 /// Code's own credentials. Upstream #2634/#2745: without consent the
 /// file/keyring sources stay closed and refreshed tokens are never rotated
@@ -1001,15 +1008,24 @@ fn record_auto_source(
 }
 
 fn claude_auto_fetch_error(failures: Vec<(&'static str, ProviderError)>) -> ProviderError {
+    let oauth_rate_limited = failures
+        .iter()
+        .any(|(source, error)| *source == "OAuth" && oauth::is_rate_limited_error(error));
+    let no_cookies = failures
+        .iter()
+        .any(|(source, error)| *source == "Web" && matches!(error, ProviderError::NoCookies));
     let summary = failures
         .into_iter()
         .map(|(source, error)| format!("{source}: {error}"))
         .collect::<Vec<_>>()
         .join("; ");
 
-    ProviderError::Other(format!(
-        "Claude usage failed from all configured sources. {summary}"
-    ))
+    let mut message = format!("Claude usage failed from all configured sources. {summary}");
+    if oauth_rate_limited && no_cookies {
+        message.push(' ');
+        message.push_str(CLAUDE_BROWSER_SIGN_IN_MARKER);
+    }
+    ProviderError::Other(message)
 }
 
 fn should_fallback_from_claude_cli_error(error: &ProviderError) -> bool {
@@ -1762,6 +1778,36 @@ Resets Dec 24 at 3:59pm (Europe/Paris)
             err.to_string(),
             "Claude usage failed from all configured sources. OAuth: OAuth error: token expired; Web: No cookies available for web API; CLI: Parse error: Empty output from Claude CLI"
         );
+    }
+
+    #[test]
+    fn auto_fetch_error_marks_browser_sign_in_when_oauth_refused_without_cookies() {
+        let refused = ClaudeOAuthFetcher::rate_limited_error(Duration::from_secs(1));
+        let err = claude_auto_fetch_error(vec![
+            ("Web", ProviderError::NoCookies),
+            ("OAuth", refused),
+            (
+                "CLI",
+                ProviderError::Parse("Claude CLI did not return usage data".to_string()),
+            ),
+        ]);
+        assert!(
+            err.to_string().ends_with(CLAUDE_BROWSER_SIGN_IN_MARKER),
+            "{err}"
+        );
+
+        // Rate limited alone (cookies were readable) is not a browser problem.
+        let err = claude_auto_fetch_error(vec![(
+            "OAuth",
+            ClaudeOAuthFetcher::rate_limited_error(Duration::from_secs(1)),
+        )]);
+        assert!(!err.to_string().contains(CLAUDE_BROWSER_SIGN_IN_MARKER));
+        // A real sign-out stays unmarked.
+        let err = claude_auto_fetch_error(vec![
+            ("Web", ProviderError::NoCookies),
+            ("OAuth", ProviderError::OAuth("token expired".to_string())),
+        ]);
+        assert!(!err.to_string().contains(CLAUDE_BROWSER_SIGN_IN_MARKER));
     }
 
     #[test]
