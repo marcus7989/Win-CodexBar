@@ -105,8 +105,11 @@ pub const CLOUDFLARE_CHALLENGE_MESSAGE: &str = concat!(
 /// usage endpoint refused the request (rate limited) while no claude.ai
 /// browser cookies were readable and the CLI probe also failed. Claude Code
 /// is signed in in that situation; what is missing is a browser session.
-/// Companion apps match this token instead of parsing the English summary.
-pub const CLAUDE_BROWSER_SIGN_IN_MARKER: &str = "[claude:browser-sign-in-required]";
+/// The marker names the page that provides it, so companion apps match
+/// `[<provider>:browser-sign-in-required <url>]` and open that page instead
+/// of parsing the English summary or keeping their own sign-in table.
+pub const CLAUDE_BROWSER_SIGN_IN_MARKER: &str =
+    "[claude:browser-sign-in-required https://claude.ai/login]";
 
 /// Whether the user explicitly consented to reading (and refreshing) Claude
 /// Code's own credentials. Upstream #2634/#2745: without consent the
