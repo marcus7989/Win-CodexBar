@@ -749,6 +749,10 @@ impl ClaudeProvider {
             .as_ref()
             .err()
             .is_some_and(is_oauth_revoked_error);
+        let oauth_rate_limited = oauth_result
+            .as_ref()
+            .err()
+            .is_some_and(oauth::is_rate_limited_error);
         if let Some(result) = record_auto_source(&mut failures, "OAuth", oauth_result) {
             return Ok(result);
         }
@@ -758,6 +762,17 @@ impl ClaudeProvider {
         if oauth_revoked && let Some(cached) = cached_cli_result() {
             tracing::debug!("Claude OAuth revoked; returning cached CLI result (15-min cache)");
             return Ok(cached);
+        }
+
+        // While the usage endpoint throttles this account, the CLI probe hits
+        // the same limit and can take ~24s, which pushes callers into a
+        // timeout. Fail fast instead: the rate-limit error keeps the last good
+        // values on screen (LastGoodFailurePolicy::Preserve).
+        if oauth_rate_limited {
+            if let Some(cached) = cached_cli_result() {
+                return Ok(cached);
+            }
+            return Err(claude_auto_fetch_error(failures));
         }
 
         if let Some(mut result) =

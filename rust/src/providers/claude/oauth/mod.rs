@@ -296,7 +296,26 @@ impl ClaudeOAuthFetcher {
         {
             return Err(ProviderError::OAuth(message));
         }
-        self.fetch_with_credentials(credentials).await
+        let rejected_token = credentials.access_token.clone();
+        match self.fetch_with_credentials(credentials).await {
+            // A long-running process (e.g. `serve`) can keep using a token from
+            // its in-memory cache after Claude Code replaced it on disk. When the
+            // API rejects the token, drop the cache and retry once with the
+            // file's token if it is a different, unexpired one.
+            Err(error @ (ProviderError::OAuthExpired(_) | ProviderError::OAuthRevoked(_))) => {
+                credentials_store::clear_cache();
+                match credentials_store::load_credentials() {
+                    Ok((disk, _)) if disk.access_token != rejected_token && !disk.is_expired() => {
+                        tracing::debug!(
+                            "Claude OAuth token rejected; retrying with the credentials file"
+                        );
+                        self.fetch_with_credentials(disk).await
+                    }
+                    _ => Err(error),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Fetch usage with an explicit OAuth access token.
