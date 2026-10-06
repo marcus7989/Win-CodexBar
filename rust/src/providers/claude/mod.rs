@@ -1192,8 +1192,14 @@ fn strip_ansi(text: &str) -> String {
                         break;
                     }
                 }
-                if final_char == Some('C') {
-                    result.push(' ');
+                match final_char {
+                    Some('C') => result.push(' '),
+                    // ConPTY places each screen row with an absolute cursor
+                    // position instead of a line break. Without the break the
+                    // /usage rows run together and every label reads the
+                    // first percentage in the screen.
+                    Some('H') => result.push('\n'),
+                    _ => {}
                 }
             // Skip OSC sequences: ESC]...BEL
             } else if chars.peek() == Some(&']') {
@@ -1945,6 +1951,43 @@ Usage:                 0 input, 0 output, 0 cache read
                 .map(|window| window.used_percent),
             Some(31.0)
         );
+    }
+
+    #[test]
+    fn parses_usage_rows_placed_by_cursor_position() {
+        // Claude Code 2.1.289 through ConPTY: no line breaks, each row starts
+        // with ESC[<row>;<col>H. Both windows used to read 18% with one shared
+        // reset text and no reset time.
+        let provider = ClaudeProvider::new();
+        let output = "\x1b[17;3HUsage:\x1b[17C0\x1b[1Cinput,\x1b[1C0\x1b[1Coutput\
+                      \x1b[19;3HCurrent\x1b[1Csession\
+                      \x1b[20;3H█████████\x1b[42C18%\x1b[1Cused\
+                      \x1b[21;3HResets\x1b[1C3:30am\x1b[1C(America/Los_Angeles)\
+                      \x1b[23;3HCurrent\x1b[1Cweek\x1b[1C(all\x1b[1Cmodels)\
+                      \x1b[24;3H██████████████████████████████████\x1b[17C68%\x1b[1Cused\
+                      \x1b[25;3HResets\x1b[1COct\x1b[1C6,\x1b[1C4am\x1b[1C(America/Los_Angeles)\
+                      \x1b[27;3HWhat's\x1b[1Ccontributing\x1b[1Cto\x1b[1Cyour\x1b[1Climits\x1b[1Cusage?";
+
+        let result = provider.parse_cli_output(output).expect("should parse");
+
+        let session = &result.usage.primary;
+        assert_eq!(session.used_percent, 18.0);
+        assert_eq!(
+            session.reset_description.as_deref(),
+            Some("Resets 3:30am (America/Los_Angeles)")
+        );
+        assert!(session.resets_at.is_some());
+
+        let weekly = result
+            .usage
+            .secondary
+            .expect("weekly usage should be present");
+        assert_eq!(weekly.used_percent, 68.0);
+        assert_eq!(
+            weekly.reset_description.as_deref(),
+            Some("Resets Oct 6, 4am (America/Los_Angeles)")
+        );
+        assert!(weekly.resets_at.is_some());
     }
 
     // ── Upstream 0.50.1 #2516: revoked vs missing OAuth ────────────────────────
