@@ -38,8 +38,8 @@ use cli_reset::{
 // When token rotation revokes OAuth access, the auto path falls back to the
 // CLI. To avoid hammering the CLI probe on every poll, cache the last
 // successful CLI result for 15 minutes. The cache is only consulted when
-// OAuth returned `OAuthRevoked` (revoked, not merely expired) so normal
-// refresh cycles are unaffected.
+// OAuth returned `OAuthRevoked` (revoked, not merely expired) or a rate
+// limit, so normal refresh cycles are unaffected.
 const CLI_RESULT_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
 struct CachedCliResult {
@@ -55,6 +55,29 @@ fn clear_account_caches(credential_path: &std::path::Path) {
         *cache = None;
     }
     oauth::clear_account_cache(credential_path);
+}
+
+// After a CLI probe failed while OAuth was rate limited, skip further probes
+// for this long so a throttled account is not probed on every poll. Short,
+// because the probe also fails when it reads the screen before the limits
+// are drawn, and the next try usually succeeds.
+const RATE_LIMITED_CLI_PROBE_BACKOFF: Duration = Duration::from_secs(60);
+
+static RATE_LIMITED_CLI_PROBE_FAILED_AT: LazyLock<Mutex<Option<Instant>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn note_rate_limited_cli_probe(succeeded: bool) {
+    if let Ok(mut guard) = RATE_LIMITED_CLI_PROBE_FAILED_AT.lock() {
+        *guard = (!succeeded).then(Instant::now);
+    }
+}
+
+fn rate_limited_cli_probe_failed_recently() -> bool {
+    RATE_LIMITED_CLI_PROBE_FAILED_AT
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .is_some_and(|failed_at| failed_at.elapsed() <= RATE_LIMITED_CLI_PROBE_BACKOFF)
 }
 
 /// Store a successful CLI fetch result in the 15-minute cache.
@@ -764,28 +787,35 @@ impl ClaudeProvider {
             return Ok(cached);
         }
 
-        // While the usage endpoint throttles this account, the CLI probe hits
-        // the same limit and can take ~24s, which pushes callers into a
-        // timeout. Fail fast instead: the rate-limit error keeps the last good
-        // values on screen (LastGoodFailurePolicy::Preserve).
+        // While the usage endpoint throttles this account, the CLI probe can
+        // take ~24s, which pushes callers into a timeout when every poll runs
+        // it. Probe the CLI once and reuse that result for the cache TTL: its
+        // /usage screen still shows session and weekly, so a first run with
+        // nothing to preserve gets values instead of an error. After a failed
+        // probe, fail fast for a while: the rate-limit error keeps the last
+        // good values on screen (LastGoodFailurePolicy::Preserve).
         if oauth_rate_limited {
             if let Some(cached) = cached_cli_result() {
                 return Ok(cached);
             }
-            return Err(claude_auto_fetch_error(failures));
+            if rate_limited_cli_probe_failed_recently() {
+                return Err(claude_auto_fetch_error(failures));
+            }
         }
 
-        if let Some(mut result) =
-            record_auto_source(&mut failures, "CLI", self.fetch_via_cli(ctx).await)
-        {
+        let cli_result = self.fetch_via_cli(ctx).await;
+        if oauth_rate_limited {
+            note_rate_limited_cli_probe(cli_result.is_ok());
+        }
+        if let Some(mut result) = record_auto_source(&mut failures, "CLI", cli_result) {
             // Without consent for reading Claude Code credentials, label the
             // CLI fallback as reduced fidelity.
             if !claude_code_consent() {
                 result.source_label = "cli (reduced fidelity)".to_string();
             }
-            // Cache the CLI result when OAuth was revoked so subsequent polls
+            // Cache the CLI result when OAuth was revoked or rate limited so polls
             // within the TTL reuse it without re-probing.
-            if oauth_revoked {
+            if oauth_revoked || oauth_rate_limited {
                 cache_cli_result(result.clone());
             }
             return Ok(result);
@@ -2001,6 +2031,16 @@ Usage:                 0 input, 0 output, 0 cache read
             "expired".to_string()
         )));
         assert!(!is_oauth_revoked_error(&ProviderError::AuthRequired));
+    }
+
+    #[test]
+    fn rate_limited_cli_probe_backs_off_only_after_a_failure() {
+        note_rate_limited_cli_probe(true);
+        assert!(!rate_limited_cli_probe_failed_recently());
+        note_rate_limited_cli_probe(false);
+        assert!(rate_limited_cli_probe_failed_recently());
+        note_rate_limited_cli_probe(true);
+        assert!(!rate_limited_cli_probe_failed_recently());
     }
 
     #[test]
