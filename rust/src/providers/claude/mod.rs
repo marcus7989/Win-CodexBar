@@ -54,8 +54,8 @@ fn clear_account_caches(credential_path: &std::path::Path) {
     if let Ok(mut cache) = CLI_RESULT_CACHE.lock() {
         *cache = None;
     }
-    if let Ok(mut last) = LAST_OAUTH_PERCENTS.lock() {
-        *last = None;
+    if let Ok(mut last) = LAST_AUTO_READING.lock() {
+        *last = LastAutoReading::default();
     }
     oauth::clear_account_cache(credential_path);
 }
@@ -83,88 +83,132 @@ fn rate_limited_cli_probe_failed_recently() -> bool {
         .is_some_and(|failed_at| failed_at.elapsed() <= RATE_LIMITED_CLI_PROBE_BACKOFF)
 }
 
-// ── Stable percentages when Auto changes source during a throttle ───────────
+// ── Stable percentages when Auto changes source ─────────────────────────────
 //
-// OAuth reports the usage endpoint's number as is (`limits[].percent`, else
-// `utilization`). The CLI source reports the whole number Claude Code prints
-// on its /usage screen (`Math.floor(utilization)`), so the two can sit one
-// point apart for the same usage. While OAuth answers 429 on some polls and
-// succeeds on others, Auto alternates between them and the number flips by
-// one and back. A CLI reading that is within that distance of the last OAuth
-// reading for the same window carries no news, so the OAuth number is kept.
-// Anything further away is a real change and passes through.
-const OAUTH_PERCENT_HOLD_TTL: Duration = Duration::from_secs(15 * 60);
+// Auto answers from OAuth while the usage endpoint responds and from the CLI
+// screen (probed once, then cached for 15 minutes) while it answers 429, so
+// the source can change from one poll to the next. The two do not carry the
+// same number: OAuth passes the endpoint's value through, the CLI screen
+// prints a whole number (`Math.floor(utilization)`), and a cached screen can
+// be minutes older than the OAuth reading before it.
+//
+// Within one usage window the used percentage only goes up. So when a reading
+// comes from another source than the number on display and belongs to the
+// same window, it replaces that number only if it is more than a rounding
+// step higher. A lower one is an older reading, and one within a rounding
+// step carries no news. Readings from the same source always pass through.
+const SOURCE_CHANGE_HOLD_TTL: Duration = Duration::from_secs(15 * 60);
 /// Largest gap between the two sources that rounding alone explains.
 const SOURCE_ROUNDING_DISTANCE: f64 = 1.0;
 /// Reset times further apart than this belong to different windows. The CLI
 /// screen prints the reset to the minute or hour; a new window is hours away.
 const SAME_WINDOW_RESET_TOLERANCE_SECS: i64 = 30 * 60;
 
-struct LastOAuthPercents {
-    primary: RateWindow,
-    secondary: Option<RateWindow>,
+const AUTO_SOURCE_OAUTH: &str = "oauth";
+const AUTO_SOURCE_CLI: &str = "cli";
+
+/// The number Auto last reported for one window, and the reading behind it.
+struct ReportedWindow {
+    window: RateWindow,
+    source: &'static str,
+    read_at: Instant,
+}
+
+#[derive(Default)]
+struct LastAutoReading {
+    primary: Option<ReportedWindow>,
+    secondary: Option<ReportedWindow>,
     account_identity: Option<String>,
-    recorded_at: Instant,
 }
 
-static LAST_OAUTH_PERCENTS: LazyLock<Mutex<Option<LastOAuthPercents>>> =
-    LazyLock::new(|| Mutex::new(None));
+static LAST_AUTO_READING: LazyLock<Mutex<LastAutoReading>> =
+    LazyLock::new(|| Mutex::new(LastAutoReading::default()));
 
-fn remember_oauth_percents(result: &ProviderFetchResult) {
-    if let Ok(mut guard) = LAST_OAUTH_PERCENTS.lock() {
-        *guard = Some(LastOAuthPercents {
-            primary: result.usage.primary.clone(),
-            secondary: result.usage.secondary.clone(),
-            account_identity: result.account_identity.clone(),
-            recorded_at: Instant::now(),
-        });
-    }
-}
-
-/// Keep the last OAuth percentages in a CLI fallback result where the CLI
-/// number differs only by rounding. Reset times and everything else stay
-/// as the CLI reported them.
-fn hold_last_oauth_percents(mut result: ProviderFetchResult) -> ProviderFetchResult {
-    if let Ok(guard) = LAST_OAUTH_PERCENTS.lock()
-        && let Some(last) = guard.as_ref()
-    {
-        hold_oauth_percents(&mut result, last, last.recorded_at.elapsed());
+/// Apply the source-change rule to a result Auto is about to return.
+/// `read_at` is when the reading was taken, which for a cached CLI result is
+/// when it was cached. Only `used_percent` is ever replaced.
+fn steady_across_source_change(
+    mut result: ProviderFetchResult,
+    source: &'static str,
+    read_at: Instant,
+) -> ProviderFetchResult {
+    if let Ok(mut last) = LAST_AUTO_READING.lock() {
+        steady_percents(&mut result, &mut last, source, read_at, Instant::now());
     }
     result
 }
 
-fn hold_oauth_percents(result: &mut ProviderFetchResult, last: &LastOAuthPercents, age: Duration) {
-    if age > OAUTH_PERCENT_HOLD_TTL {
-        return;
+fn steady_percents(
+    result: &mut ProviderFetchResult,
+    last: &mut LastAutoReading,
+    source: &'static str,
+    read_at: Instant,
+    now: Instant,
+) {
+    // Both identities come from the credential; a mismatch means this reading
+    // belongs to another account than the number on display.
+    if let Some(identity) = &result.account_identity {
+        if last
+            .account_identity
+            .as_ref()
+            .is_some_and(|previous| previous != identity)
+        {
+            *last = LastAutoReading::default();
+        }
+        last.account_identity = Some(identity.clone());
     }
-    // Both identities come from the credential; a mismatch means the CLI is
-    // signed in to another account than the OAuth reading belonged to.
-    if let (Some(cli), Some(oauth)) = (&result.account_identity, &last.account_identity)
-        && cli != oauth
-    {
-        return;
-    }
-    hold_percent_within_rounding(&mut result.usage.primary, &last.primary);
-    if let (Some(cli), Some(oauth)) = (result.usage.secondary.as_mut(), last.secondary.as_ref()) {
-        hold_percent_within_rounding(cli, oauth);
+    steady_window(
+        &mut result.usage.primary,
+        &mut last.primary,
+        source,
+        read_at,
+        now,
+    );
+    if let Some(secondary) = result.usage.secondary.as_mut() {
+        steady_window(secondary, &mut last.secondary, source, read_at, now);
     }
 }
 
-fn hold_percent_within_rounding(cli: &mut RateWindow, oauth: &RateWindow) {
-    if cli.is_informational || oauth.is_informational {
-        return;
-    }
-    // A reached limit is a state of its own, never a rounding artefact.
-    if cli.used_percent >= 100.0 || oauth.used_percent >= 100.0 {
-        return;
-    }
-    if let (Some(cli_reset), Some(oauth_reset)) = (cli.resets_at, oauth.resets_at)
-        && (cli_reset - oauth_reset).num_seconds().abs() > SAME_WINDOW_RESET_TOLERANCE_SECS
+fn steady_window(
+    window: &mut RateWindow,
+    last: &mut Option<ReportedWindow>,
+    source: &'static str,
+    read_at: Instant,
+    now: Instant,
+) {
+    if let Some(previous) = last.as_ref()
+        && previous.source != source
+        && now.saturating_duration_since(previous.read_at) <= SOURCE_CHANGE_HOLD_TTL
+        && is_same_usage_window(window, &previous.window)
+        && window.used_percent <= previous.window.used_percent + SOURCE_ROUNDING_DISTANCE
     {
+        // The number on display stays, and so does the reading behind it:
+        // its age keeps counting, so the hold ends on its own.
+        window.used_percent = previous.window.used_percent;
         return;
     }
-    if (cli.used_percent - oauth.used_percent).abs() <= SOURCE_ROUNDING_DISTANCE {
-        cli.used_percent = oauth.used_percent;
+    *last = Some(ReportedWindow {
+        window: window.clone(),
+        source,
+        read_at,
+    });
+}
+
+/// Whether two readings can be compared as the same usage window. Without a
+/// reset time on both sides a new window cannot be told from an old one.
+fn is_same_usage_window(new: &RateWindow, previous: &RateWindow) -> bool {
+    if new.is_informational || previous.is_informational {
+        return false;
+    }
+    // A reached limit is a state of its own and is never held or held back.
+    if new.used_percent >= 100.0 || previous.used_percent >= 100.0 {
+        return false;
+    }
+    match (new.resets_at, previous.resets_at) {
+        (Some(new_reset), Some(previous_reset)) => {
+            (new_reset - previous_reset).num_seconds().abs() <= SAME_WINDOW_RESET_TOLERANCE_SECS
+        }
+        _ => false,
     }
 }
 
@@ -181,6 +225,11 @@ fn cache_cli_result(result: ProviderFetchResult) {
 /// Return a cached CLI result if it is still within the TTL. Used when
 /// revoked OAuth prevents a live fetch and the CLI should not be re-probed.
 fn cached_cli_result() -> Option<ProviderFetchResult> {
+    cached_cli_result_with_time().map(|(result, _)| result)
+}
+
+/// The cached CLI result together with the time it was read from the CLI.
+fn cached_cli_result_with_time() -> Option<(ProviderFetchResult, Instant)> {
     let Ok(guard) = CLI_RESULT_CACHE.lock() else {
         return None;
     };
@@ -192,8 +241,14 @@ fn cached_cli_result() -> Option<ProviderFetchResult> {
             // A retained payload is useful for display, but cannot prove that
             // the current fetch reached Claude CLI successfully.
             result.has_successful_claude_cli_quota = false;
-            result
+            (result, entry.cached_at)
         })
+}
+
+/// The cached CLI result as Auto returns it, with the source-change rule applied.
+fn cached_cli_result_for_auto() -> Option<ProviderFetchResult> {
+    cached_cli_result_with_time()
+        .map(|(result, read_at)| steady_across_source_change(result, AUTO_SOURCE_CLI, read_at))
 }
 
 /// Whether the OAuth source failed with a revocation (not just expiry).
@@ -865,13 +920,16 @@ impl ClaudeProvider {
             .err()
             .is_some_and(oauth::is_rate_limited_error);
         if let Some(result) = record_auto_source(&mut failures, "OAuth", oauth_result) {
-            remember_oauth_percents(&result);
-            return Ok(result);
+            return Ok(steady_across_source_change(
+                result,
+                AUTO_SOURCE_OAUTH,
+                Instant::now(),
+            ));
         }
 
         // When OAuth was revoked (not just expired), reuse a cached CLI result
         // if still within the 15-minute TTL to avoid re-probing the CLI.
-        if oauth_revoked && let Some(cached) = cached_cli_result() {
+        if oauth_revoked && let Some(cached) = cached_cli_result_for_auto() {
             tracing::debug!("Claude OAuth revoked; returning cached CLI result (15-min cache)");
             return Ok(cached);
         }
@@ -884,8 +942,8 @@ impl ClaudeProvider {
         // probe, fail fast for a while: the rate-limit error keeps the last
         // good values on screen (LastGoodFailurePolicy::Preserve).
         if oauth_rate_limited {
-            if let Some(cached) = cached_cli_result() {
-                return Ok(hold_last_oauth_percents(cached));
+            if let Some(cached) = cached_cli_result_for_auto() {
+                return Ok(cached);
             }
             if rate_limited_cli_probe_failed_recently() {
                 return Err(claude_auto_fetch_error(failures));
@@ -907,15 +965,16 @@ impl ClaudeProvider {
             if oauth_revoked || oauth_rate_limited {
                 cache_cli_result(result.clone());
             }
-            if oauth_rate_limited {
-                result = hold_last_oauth_percents(result);
-            }
-            return Ok(result);
+            return Ok(steady_across_source_change(
+                result,
+                AUTO_SOURCE_CLI,
+                Instant::now(),
+            ));
         }
 
         // Upstream 0.50.1 #2516: when all live sources fail, keep the
         // last-known quota visible (stale) instead of blanking the UI.
-        if let Some(cached) = cached_cli_result() {
+        if let Some(cached) = cached_cli_result_for_auto() {
             tracing::debug!("All Claude live sources failed; returning stale cached CLI result");
             return Ok(cached);
         }
@@ -2135,20 +2194,22 @@ Usage:                 0 input, 0 output, 0 cache read
         assert!(!rate_limited_cli_probe_failed_recently());
     }
 
-    fn usage_result(source: &str, session: f64, weekly: f64) -> ProviderFetchResult {
-        let reset = |minutes: i64| Some(Utc::now() + chrono::Duration::minutes(minutes));
-        let usage = UsageSnapshot::new(RateWindow::with_details(
-            session,
-            Some(300),
-            reset(120),
-            None,
-        ))
-        .with_secondary(RateWindow::with_details(
-            weekly,
-            Some(10080),
-            reset(4000),
-            None,
-        ));
+    /// A reading with session and weekly windows. The CLI prints its reset
+    /// times to the minute, so they sit a little off the OAuth ones.
+    fn reading(source: &str, session: f64, weekly: f64) -> ProviderFetchResult {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-10-07T12:00:00Z")
+            .expect("base time")
+            .with_timezone(&Utc);
+        let skew = if source == AUTO_SOURCE_CLI { 40 } else { 0 };
+        let reset = |hours: i64| Some(base + chrono::Duration::seconds(hours * 3600 + skew));
+        let usage =
+            UsageSnapshot::new(RateWindow::with_details(session, Some(300), reset(2), None))
+                .with_secondary(RateWindow::with_details(
+                    weekly,
+                    Some(10080),
+                    reset(70),
+                    None,
+                ));
         ProviderFetchResult::new(usage, source)
     }
 
@@ -2164,99 +2225,227 @@ Usage:                 0 input, 0 output, 0 cache read
         )
     }
 
-    fn last_oauth(result: &ProviderFetchResult) -> LastOAuthPercents {
-        LastOAuthPercents {
-            primary: result.usage.primary.clone(),
-            secondary: result.usage.secondary.clone(),
-            account_identity: result.account_identity.clone(),
-            recorded_at: Instant::now(),
-        }
+    /// Replays readings against one state, each `secs` after the start, and
+    /// returns what Auto would report for them.
+    fn replay(
+        last: &mut LastAutoReading,
+        start: Instant,
+        readings: Vec<(u64, &'static str, ProviderFetchResult)>,
+    ) -> Vec<(f64, f64)> {
+        readings
+            .into_iter()
+            .map(|(secs, source, mut result)| {
+                let at = start + Duration::from_secs(secs);
+                steady_percents(&mut result, last, source, at, at);
+                percents(&result)
+            })
+            .collect()
     }
 
-    // DreamyTalesPAN/CodexBar-Display#531: OAuth 7 / 9, then a throttled poll
+    // Windows bench, 45 minutes with rising usage: OAuth 18, then throttled
+    // polls answered from the cached CLI screen with 16, then OAuth 19.
+    #[test]
+    fn older_cached_cli_reading_does_not_take_the_percentage_back() {
+        let oauth = steady_across_source_change(
+            reading(AUTO_SOURCE_OAUTH, 18.0, 17.0),
+            AUTO_SOURCE_OAUTH,
+            Instant::now(),
+        );
+        assert_eq!(percents(&oauth), (18.0, 17.0));
+
+        // The CLI screen was read before that OAuth poll and is replayed from
+        // the cache on every throttled poll.
+        let cached_at = Instant::now();
+        for _ in 0..3 {
+            let cached = steady_across_source_change(
+                reading(AUTO_SOURCE_CLI, 16.0, 17.0),
+                AUTO_SOURCE_CLI,
+                cached_at,
+            );
+            assert_eq!(percents(&cached), (18.0, 17.0));
+            assert_eq!(cached.source_label, "cli");
+        }
+
+        let oauth = steady_across_source_change(
+            reading(AUTO_SOURCE_OAUTH, 19.0, 17.0),
+            AUTO_SOURCE_OAUTH,
+            Instant::now(),
+        );
+        assert_eq!(percents(&oauth), (19.0, 17.0));
+    }
+
+    // DreamyTalesPAN/CodexBar-Display#531: OAuth 7 / 9, a throttled poll
     // answered by the CLI screen with 8 / 10, then OAuth 7 / 9 again.
     #[test]
-    fn cli_fallback_within_rounding_keeps_the_last_oauth_percentages() {
-        let oauth = usage_result("oauth", 7.0, 9.0);
-        remember_oauth_percents(&oauth);
-        let before = percents(&oauth);
-
-        let throttled = hold_last_oauth_percents(usage_result("cli", 8.0, 10.0));
-        assert_eq!(percents(&throttled), before);
-        assert_eq!(throttled.source_label, "cli");
-
-        let after = usage_result("oauth", 7.0, 9.0);
-        remember_oauth_percents(&after);
-        assert_eq!(percents(&after), before);
-
-        // Fractional OAuth values against the floored CLI screen.
-        remember_oauth_percents(&usage_result("oauth", 7.6, 9.4));
-        let floored = hold_last_oauth_percents(usage_result("cli", 7.0, 9.0));
-        assert_eq!(percents(&floored), (7.6, 9.4));
-    }
-
-    #[test]
-    fn cli_fallback_beyond_rounding_passes_through() {
-        let last = last_oauth(&usage_result("oauth", 7.0, 9.0));
-
-        // Each window is judged on its own: session moved, weekly did not.
-        let mut cli = usage_result("cli", 9.0, 10.0);
-        hold_oauth_percents(&mut cli, &last, Duration::ZERO);
-        assert_eq!(percents(&cli), (9.0, 9.0));
-
-        let mut lower = usage_result("cli", 5.0, 7.0);
-        hold_oauth_percents(&mut lower, &last, Duration::ZERO);
-        assert_eq!(percents(&lower), (5.0, 7.0));
-    }
-
-    #[test]
-    fn cli_fallback_is_not_held_past_the_ttl_or_across_accounts() {
-        let oauth = usage_result("oauth", 7.0, 9.0).with_account_identity("claude-account:a");
-        let last = last_oauth(&oauth);
-
-        let mut expired = usage_result("cli", 8.0, 10.0);
-        hold_oauth_percents(
-            &mut expired,
-            &last,
-            OAUTH_PERCENT_HOLD_TTL + Duration::from_secs(1),
+    fn source_change_within_a_rounding_step_keeps_the_percentage() {
+        let mut last = LastAutoReading::default();
+        let reported = replay(
+            &mut last,
+            Instant::now(),
+            vec![
+                (0, AUTO_SOURCE_OAUTH, reading(AUTO_SOURCE_OAUTH, 7.0, 9.0)),
+                (30, AUTO_SOURCE_CLI, reading(AUTO_SOURCE_CLI, 8.0, 10.0)),
+                (60, AUTO_SOURCE_OAUTH, reading(AUTO_SOURCE_OAUTH, 7.0, 9.0)),
+                // Fractional OAuth values against the floored CLI screen.
+                (90, AUTO_SOURCE_OAUTH, reading(AUTO_SOURCE_OAUTH, 7.6, 9.4)),
+                (120, AUTO_SOURCE_CLI, reading(AUTO_SOURCE_CLI, 7.0, 9.0)),
+            ],
         );
-        assert_eq!(percents(&expired), (8.0, 10.0));
-
-        let mut other = usage_result("cli", 8.0, 10.0).with_account_identity("claude-account:b");
-        hold_oauth_percents(&mut other, &last, Duration::ZERO);
-        assert_eq!(percents(&other), (8.0, 10.0));
-
-        let mut same = usage_result("cli", 8.0, 10.0).with_account_identity("claude-account:a");
-        hold_oauth_percents(&mut same, &last, Duration::ZERO);
-        assert_eq!(percents(&same), (7.0, 9.0));
+        assert_eq!(
+            reported,
+            vec![(7.0, 9.0), (7.0, 9.0), (7.0, 9.0), (7.6, 9.4), (7.6, 9.4)]
+        );
     }
 
     #[test]
-    fn cli_fallback_is_not_held_for_a_new_window_or_a_reached_limit() {
-        // Session rolled over: the CLI reset time is hours after the OAuth one.
-        let mut oauth = RateWindow::with_details(1.0, Some(300), Some(Utc::now()), None);
-        let mut cli = RateWindow::with_details(
-            0.0,
-            Some(300),
-            Some(Utc::now() + chrono::Duration::hours(5)),
-            None,
+    fn higher_reading_from_another_source_passes_through() {
+        let mut last = LastAutoReading::default();
+        let reported = replay(
+            &mut last,
+            Instant::now(),
+            vec![
+                (0, AUTO_SOURCE_OAUTH, reading(AUTO_SOURCE_OAUTH, 17.0, 17.0)),
+                // Each window is judged on its own: session moved, weekly did not.
+                (30, AUTO_SOURCE_CLI, reading(AUTO_SOURCE_CLI, 19.0, 18.0)),
+                // The CLI number is now on display; an OAuth reading below it
+                // is held back, one above it passes.
+                (
+                    60,
+                    AUTO_SOURCE_OAUTH,
+                    reading(AUTO_SOURCE_OAUTH, 18.4, 17.0),
+                ),
+                (
+                    90,
+                    AUTO_SOURCE_OAUTH,
+                    reading(AUTO_SOURCE_OAUTH, 21.0, 18.0),
+                ),
+            ],
         );
-        hold_percent_within_rounding(&mut cli, &oauth);
-        assert_eq!(cli.used_percent, 0.0);
+        assert_eq!(
+            reported,
+            vec![(17.0, 17.0), (19.0, 17.0), (19.0, 17.0), (21.0, 18.0)]
+        );
+    }
 
-        // The CLI reset is printed to the minute; that is still the same window.
-        cli.resets_at = oauth.resets_at.map(|at| at + chrono::Duration::seconds(40));
-        hold_percent_within_rounding(&mut cli, &oauth);
-        assert_eq!(cli.used_percent, 1.0);
+    #[test]
+    fn same_source_reading_always_passes_through() {
+        let mut last = LastAutoReading::default();
+        let reported = replay(
+            &mut last,
+            Instant::now(),
+            vec![
+                (0, AUTO_SOURCE_OAUTH, reading(AUTO_SOURCE_OAUTH, 18.0, 17.0)),
+                (
+                    30,
+                    AUTO_SOURCE_OAUTH,
+                    reading(AUTO_SOURCE_OAUTH, 16.0, 17.5),
+                ),
+            ],
+        );
+        assert_eq!(reported, vec![(18.0, 17.0), (16.0, 17.5)]);
+    }
 
-        oauth.used_percent = 99.4;
-        cli.used_percent = 100.0;
-        hold_percent_within_rounding(&mut cli, &oauth);
-        assert_eq!(cli.used_percent, 100.0);
+    #[test]
+    fn new_window_passes_through_at_once() {
+        let mut last = LastAutoReading::default();
+        let start = Instant::now();
+        let mut oauth = reading(AUTO_SOURCE_OAUTH, 18.0, 17.0);
+        steady_percents(&mut oauth, &mut last, AUTO_SOURCE_OAUTH, start, start);
 
-        let mut idle = RateWindow::new(1.0);
-        hold_percent_within_rounding(&mut idle, &RateWindow::no_active_session());
-        assert_eq!(idle.used_percent, 1.0);
+        // The session rolled over: low number, reset time five hours later.
+        let mut rolled = reading(AUTO_SOURCE_CLI, 2.0, 17.0);
+        rolled.usage.primary.resets_at = rolled
+            .usage
+            .primary
+            .resets_at
+            .map(|at| at + chrono::Duration::hours(5));
+        steady_percents(&mut rolled, &mut last, AUTO_SOURCE_CLI, start, start);
+        assert_eq!(percents(&rolled), (2.0, 17.0));
+
+        // The next OAuth reading for the new window is compared with that one.
+        let mut next = reading(AUTO_SOURCE_OAUTH, 4.0, 17.0);
+        next.usage.primary.resets_at = rolled.usage.primary.resets_at;
+        steady_percents(&mut next, &mut last, AUTO_SOURCE_OAUTH, start, start);
+        assert_eq!(percents(&next), (4.0, 17.0));
+    }
+
+    #[test]
+    fn lower_reading_is_not_held_back_without_a_comparable_window() {
+        let held_back = |mut previous: ProviderFetchResult, mut next: ProviderFetchResult| {
+            let mut last = LastAutoReading::default();
+            let start = Instant::now();
+            steady_percents(&mut previous, &mut last, AUTO_SOURCE_OAUTH, start, start);
+            steady_percents(&mut next, &mut last, AUTO_SOURCE_CLI, start, start);
+            next.usage.primary.used_percent
+        };
+        let oauth = || reading(AUTO_SOURCE_OAUTH, 18.0, 17.0);
+        let cli = || reading(AUTO_SOURCE_CLI, 16.0, 17.0);
+        assert_eq!(held_back(oauth(), cli()), 18.0);
+
+        // No reset time on the CLI screen: a new window cannot be ruled out.
+        let mut no_reset = cli();
+        no_reset.usage.primary.resets_at = None;
+        assert_eq!(held_back(oauth(), no_reset), 16.0);
+
+        // Another account.
+        assert_eq!(
+            held_back(
+                oauth().with_account_identity("claude-account:a"),
+                cli().with_account_identity("claude-account:b"),
+            ),
+            16.0
+        );
+        assert_eq!(
+            held_back(
+                oauth().with_account_identity("claude-account:a"),
+                cli().with_account_identity("claude-account:a"),
+            ),
+            18.0
+        );
+
+        // A reached limit, on either side.
+        assert_eq!(
+            held_back(reading(AUTO_SOURCE_OAUTH, 100.0, 17.0), cli()),
+            16.0
+        );
+        assert_eq!(
+            held_back(reading(AUTO_SOURCE_OAUTH, 99.4, 17.0), {
+                let mut full = cli();
+                full.usage.primary.used_percent = 100.0;
+                full
+            }),
+            100.0
+        );
+
+        // No active session on the OAuth side.
+        let mut idle = oauth();
+        idle.usage.primary = RateWindow::no_active_session();
+        assert_eq!(held_back(idle, cli()), 16.0);
+    }
+
+    #[test]
+    fn held_percentage_ends_with_the_age_of_the_reading_behind_it() {
+        let mut last = LastAutoReading::default();
+        let ttl = SOURCE_CHANGE_HOLD_TTL.as_secs();
+        let reported = replay(
+            &mut last,
+            Instant::now(),
+            vec![
+                (0, AUTO_SOURCE_OAUTH, reading(AUTO_SOURCE_OAUTH, 18.0, 17.0)),
+                // Held polls do not renew the reading behind the number.
+                (300, AUTO_SOURCE_CLI, reading(AUTO_SOURCE_CLI, 16.0, 17.0)),
+                (ttl, AUTO_SOURCE_CLI, reading(AUTO_SOURCE_CLI, 16.0, 17.0)),
+                (
+                    ttl + 1,
+                    AUTO_SOURCE_CLI,
+                    reading(AUTO_SOURCE_CLI, 16.0, 17.0),
+                ),
+            ],
+        );
+        assert_eq!(
+            reported,
+            vec![(18.0, 17.0), (18.0, 17.0), (18.0, 17.0), (16.0, 17.0)]
+        );
     }
 
     #[test]
