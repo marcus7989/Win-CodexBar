@@ -4,10 +4,14 @@
 //! the additive `daily` field on `/cost` — the web dashboard's daily spend bar
 //! charts ride this array (upstream #2722 fetches `/cost` for the same data).
 
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::cli::usage::ProviderSelection;
-use crate::core::{CostScanOptions, FetchContext, ProviderId, SourceMode, instantiate_provider};
+use crate::core::{
+    CostScanOptions, FetchContext, ProviderFetchResult, ProviderId, SourceMode,
+    instantiate_provider, provider_pace_json,
+};
 use crate::cost_scanner::{self, CostScanner};
 
 use super::json_response;
@@ -51,12 +55,7 @@ pub async fn usage_response(provider: Option<&str>, source: Option<&str>) -> Str
     for provider_id in selection.as_list() {
         let provider = instantiate_provider(provider_id);
         match provider.fetch_usage(&ctx).await {
-            Ok(result) => results.push(json!({
-                "provider": provider_id.cli_name(),
-                "source": result.source_label,
-                "usage": result.usage,
-                "cost": result.cost,
-            })),
+            Ok(result) => results.push(usage_item(provider_id, &result, None)),
             Err(error) => results.push(json!({
                 "provider": provider_id.cli_name(),
                 "error": error.to_string(),
@@ -64,6 +63,25 @@ pub async fn usage_response(provider: Option<&str>, source: Option<&str>) -> Str
         }
     }
     json_response(200, serde_json::Value::Array(results))
+}
+
+/// One provider's `/usage` entry. `pace` is present only where a window has
+/// one, in the shape of CodexBar's own `serve`; VibeTV reads it from here.
+fn usage_item(
+    provider_id: ProviderId,
+    result: &ProviderFetchResult,
+    now: Option<DateTime<Utc>>,
+) -> serde_json::Value {
+    let mut item = json!({
+        "provider": provider_id.cli_name(),
+        "source": result.source_label,
+        "usage": result.usage,
+        "cost": result.cost,
+    });
+    if let Some(pace) = provider_pace_json(provider_id, &result.usage, now) {
+        item["pace"] = pace;
+    }
+    item
 }
 
 pub async fn cost_response(provider: Option<&str>) -> String {
@@ -139,6 +157,129 @@ fn daily_json(daily: Vec<(String, Option<f64>)>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{RateWindow, UsageSnapshot};
+
+    /// Codex and Claude entries of the CodexBar 0.63.0 (macOS) `serve`
+    /// `/usage` recording VibeTV tests against, cut down to the usage windows
+    /// and the pace.
+    const MAC_SERVE_USAGE: &str =
+        include_str!("fixtures/codexbar-macos-0.63.0-serve-usage-pace.json");
+
+    fn recorded_window(window: &serde_json::Value) -> Option<RateWindow> {
+        if window.is_null() {
+            return None;
+        }
+        Some(RateWindow::with_details(
+            window["usedPercent"].as_f64().unwrap(),
+            window["windowMinutes"]
+                .as_u64()
+                .map(|minutes| u32::try_from(minutes).unwrap()),
+            window["resetsAt"].as_str().map(|at| at.parse().unwrap()),
+            None,
+        ))
+    }
+
+    /// The recording has no clock of its own. Each entry is taken half a
+    /// second into the second its `updatedAt` names; the recorded ETA only
+    /// fits a moment between 08:30:18.26 and 08:30:19.02.
+    fn recorded_entry(provider: &str) -> (serde_json::Value, ProviderFetchResult, DateTime<Utc>) {
+        let entries: serde_json::Value = serde_json::from_str(MAC_SERVE_USAGE).unwrap();
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["provider"] == provider)
+            .unwrap()
+            .clone();
+        let usage = &entry["usage"];
+        // Upstream's absent session is `primary: null`; here it is the
+        // informational placeholder.
+        let primary =
+            recorded_window(&usage["primary"]).unwrap_or_else(RateWindow::no_active_session);
+        let mut snapshot = UsageSnapshot::new(primary);
+        if let Some(secondary) = recorded_window(&usage["secondary"]) {
+            snapshot = snapshot.with_secondary(secondary);
+        }
+        let updated_at: DateTime<Utc> = usage["updatedAt"].as_str().unwrap().parse().unwrap();
+        let now = updated_at + chrono::Duration::milliseconds(500);
+        let result = ProviderFetchResult::new(snapshot, entry["source"].as_str().unwrap());
+        (entry, result, now)
+    }
+
+    fn assert_same_pace(got: &serde_json::Value, want: &serde_json::Value, lane: &str) {
+        let (got, want) = (got.as_object().unwrap(), want.as_object().unwrap());
+        assert_eq!(
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>(),
+            "{lane}: field names"
+        );
+        for (field, value) in want {
+            assert_eq!(&got[field], value, "{lane}.{field}");
+        }
+    }
+
+    #[test]
+    fn usage_item_carries_the_pace_of_both_windows_in_the_mac_shape() {
+        let (recorded, result, now) = recorded_entry("claude");
+        let item = usage_item(ProviderId::Claude, &result, Some(now));
+        let (got, want) = (&item["pace"], &recorded["pace"]);
+        assert_eq!(got.as_object().unwrap().len(), 2);
+        assert_same_pace(&got["primary"], &want["primary"], "primary");
+        assert_same_pace(&got["secondary"], &want["secondary"], "secondary");
+        // Spelled out once, so a changed fixture cannot hide a changed shape.
+        assert_eq!(
+            got["primary"],
+            json!({
+                "deltaPercent": -25,
+                "expectedUsedPercent": 33,
+                "stage": "farBehind",
+                "summary": "25% in reserve | Expected 33% used | Lasts until reset",
+                "willLastToReset": true
+            })
+        );
+        assert_eq!(item["provider"], "claude");
+        assert!(item["usage"].is_object());
+    }
+
+    #[test]
+    fn usage_item_carries_the_eta_of_a_window_that_runs_out() {
+        let (recorded, result, now) = recorded_entry("codex");
+        let item = usage_item(ProviderId::Codex, &result, Some(now));
+        let got = item["pace"].as_object().unwrap();
+        // Weekly-only plan: no session lane, as in the recording.
+        assert_eq!(got.keys().collect::<Vec<_>>(), ["secondary"]);
+        assert_same_pace(
+            &got["secondary"],
+            &recorded["pace"]["secondary"],
+            "secondary",
+        );
+        assert_eq!(got["secondary"]["etaSeconds"], json!(230_241));
+        assert_eq!(got["secondary"]["stage"], "farAhead");
+    }
+
+    #[test]
+    fn usage_item_leaves_out_the_pace_of_a_window_without_reset() {
+        // The recorded Claude reading, its session without a reset time.
+        let (recorded, mut result, now) = recorded_entry("claude");
+        result.usage.primary.resets_at = None;
+        let item = usage_item(ProviderId::Claude, &result, Some(now));
+        assert!(item["pace"].get("primary").is_none());
+        assert_same_pace(
+            &item["pace"]["secondary"],
+            &recorded["pace"]["secondary"],
+            "secondary",
+        );
+
+        // No window with a reset time: no `pace` key at all.
+        let bare = ProviderFetchResult::new(
+            UsageSnapshot::new(RateWindow::new(40.0)).with_secondary(RateWindow::new(40.0)),
+            "oauth",
+        );
+        let item = usage_item(ProviderId::Claude, &bare, Some(now));
+        assert!(item.get("pace").is_none());
+        assert!(item["usage"].is_object());
+        assert_eq!(item["source"], "oauth");
+    }
 
     #[test]
     fn daily_array_shape_matches_dashboard_charts_contract() {
