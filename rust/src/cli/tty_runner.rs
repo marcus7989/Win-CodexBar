@@ -432,6 +432,10 @@ impl TtyCommandRunner {
             .filter(|line| !line.trim().is_empty())
             .collect();
         write_script_lines(&mut writer, &script_lines, options);
+        // A trigger that already arrived during the initial delay must fire
+        // now: the main loop only checks triggers when a new chunk arrives,
+        // and a dialog waiting for an answer prints nothing more.
+        fire_send_triggers(&buffer, options, &mut triggered_sends, &mut writer);
         // The idle timer measures silence after our input, not startup time.
         last_output_time = Instant::now();
         let mut pending_script_retries: Vec<Duration> = options
@@ -548,16 +552,7 @@ impl TtyCommandRunner {
                 }
 
                 // Check for send triggers
-                for (trigger, keys) in &options.send_on_substrings {
-                    if !triggered_sends.contains(trigger) && buffer.contains(trigger) {
-                        let normalized = keys.replace('\n', "\r\n");
-                        // Best-effort send-trigger input; a closed PTY drops the write.
-                        let _trigger_written = write!(writer, "{}", normalized);
-                        // Best-effort flush after a send-trigger write.
-                        let _trigger_flushed = writer.flush();
-                        triggered_sends.insert(trigger.clone());
-                    }
-                }
+                fire_send_triggers(&buffer, options, &mut triggered_sends, &mut writer);
             }
 
             if stopped_early {
@@ -747,6 +742,26 @@ fn write_script_lines(
     options: &TtyCommandOptions,
 ) {
     write_script_lines_impl(writer, script_lines, options)
+}
+
+/// Send the keys of every trigger that is visible in `buffer` and has not
+/// fired yet. Each trigger fires at most once per session.
+fn fire_send_triggers(
+    buffer: &str,
+    options: &TtyCommandOptions,
+    triggered_sends: &mut std::collections::HashSet<String>,
+    writer: &mut Box<dyn Write + Send>,
+) {
+    for (trigger, keys) in &options.send_on_substrings {
+        if !triggered_sends.contains(trigger) && buffer.contains(trigger) {
+            let normalized = keys.replace('\n', "\r\n");
+            // Best-effort send-trigger input; a closed PTY drops the write.
+            let _trigger_written = write!(writer, "{}", normalized);
+            // Best-effort flush after a send-trigger write.
+            let _trigger_flushed = writer.flush();
+            triggered_sends.insert(trigger.clone());
+        }
+    }
 }
 
 /// Kill a process and all of its descendants (best effort, Windows only).
