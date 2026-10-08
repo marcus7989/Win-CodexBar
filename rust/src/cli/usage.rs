@@ -369,19 +369,7 @@ fn render_json_result(
     result: ProviderFetchResult,
     status: Option<&StatusInfo>,
 ) -> serde_json::Value {
-    let usage = &result.usage;
-    let primary_pace = usage
-        .primary
-        .window_minutes
-        .is_some_and(|m| m == crate::core::SESSION_WINDOW_MINUTES)
-        .then(|| UsagePace::weekly(&usage.primary, None, crate::core::SESSION_WINDOW_MINUTES))
-        .flatten()
-        .map(pace_json);
-    let secondary_pace = usage
-        .secondary
-        .as_ref()
-        .and_then(|w| UsagePace::weekly(w, None, w.window_minutes.unwrap_or(10080)))
-        .map(pace_json);
+    let pace = crate::core::provider_pace_json(provider_id, &result.usage, None);
 
     let mut json_result = serde_json::json!({
         "provider": provider_id.cli_name(),
@@ -389,11 +377,9 @@ fn render_json_result(
         "usage": result.usage,
         "cost": result.cost,
     });
-    if primary_pace.is_some() || secondary_pace.is_some() {
-        json_result["pace"] = serde_json::json!({
-            "primary": primary_pace,
-            "secondary": secondary_pace,
-        });
+    // Same object as `serve` `/usage`, in the shape of CodexBar's own CLI.
+    if let Some(pace) = pace {
+        json_result["pace"] = pace;
     }
 
     if let Some(s) = status {
@@ -404,16 +390,6 @@ fn render_json_result(
     }
 
     json_result
-}
-
-/// Serialize a [`UsagePace`] into a compact JSON object for the `--json` output.
-fn pace_json(pace: UsagePace) -> serde_json::Value {
-    serde_json::json!({
-        "stage": format!("{:?}", pace.stage).to_lowercase(),
-        "deltaPercent": pace.delta_percent,
-        "expectedUsedPercent": pace.expected_used_percent,
-        "willLastToReset": pace.will_last_to_reset,
-    })
 }
 
 fn print_usage_output(output: UsageOutput) -> anyhow::Result<()> {
@@ -747,6 +723,42 @@ mod tests {
 
     fn fetch_result(usage: UsageSnapshot) -> ProviderFetchResult {
         ProviderFetchResult::new(usage, "test")
+    }
+
+    #[test]
+    fn json_result_carries_the_pace_in_the_shape_of_serve_usage() {
+        let now = chrono::Utc::now();
+        let session = RateWindow::with_details(
+            10.0,
+            Some(300),
+            Some(now + chrono::Duration::minutes(150)),
+            None,
+        );
+        let weekly = RateWindow::with_details(
+            90.0,
+            Some(10080),
+            Some(now + chrono::Duration::minutes(5040)),
+            None,
+        );
+        let usage = UsageSnapshot::new(session).with_secondary(weekly);
+        let json = render_json_result(ProviderId::Claude, fetch_result(usage), None);
+        assert_eq!(json["pace"]["primary"]["stage"], "farBehind");
+        assert_eq!(json["pace"]["primary"]["deltaPercent"], -40);
+        assert_eq!(json["pace"]["primary"]["willLastToReset"], true);
+        assert_eq!(json["pace"]["secondary"]["stage"], "farAhead");
+        assert_eq!(json["pace"]["secondary"]["deltaPercent"], 40);
+        assert!(json["pace"]["secondary"]["etaSeconds"].is_i64());
+        assert!(
+            json["pace"]["secondary"]["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("40% in deficit | Expected 50% used | Runs out in ")
+        );
+
+        // No reset time anywhere: the key is left out, not written as null.
+        let bare = UsageSnapshot::new(RateWindow::new(10.0));
+        let json = render_json_result(ProviderId::Claude, fetch_result(bare), None);
+        assert!(json.get("pace").is_none());
     }
 
     fn sample_swap_account() -> ClaudeSwapAccount {
