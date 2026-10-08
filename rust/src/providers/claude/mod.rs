@@ -679,12 +679,16 @@ async fn rerun_claude_usage_after_trust_prompt(
     }
 
     let answer_keys = claude_trust_prompt_answer_keys(&strip_ansi(&combined).to_lowercase());
-    run_claude_trust_preflight(claude_path.clone(), probe_dir.clone(), answer_keys).await?;
+    let preflight =
+        run_claude_trust_preflight(claude_path.clone(), probe_dir.clone(), answer_keys).await?;
+    tracing::trace!(output = %strip_ansi(&preflight), "Claude trust preflight output");
     run_claude_usage_pty_probe(claude_path, probe_dir).await
 }
 
 /// Enter, then /exit once the folder is trusted.
 const CLAUDE_TRUST_ACCEPT_FIRST_OPTION: &str = "\r/exit\r";
+/// How long the trust dialog must be visible before the preflight answers.
+const CLAUDE_DIALOG_ANSWER_DELAY_SECS: f64 = 1.0;
 /// Arrow down to the second option, Enter, then /exit.
 const CLAUDE_TRUST_ACCEPT_SECOND_OPTION: &str = "\x1b[B\r/exit\r";
 
@@ -796,7 +800,12 @@ async fn run_claude_pty_probe(
             options = options.with_idle_timeout_after_done(idle);
         }
         if let Some((trigger, keys)) = probe.send_on_substring {
-            options = options.with_send_on_substring(trigger, keys);
+            // Claude Code ignores keys that reach a dialog within 150-500 ms
+            // of it opening and resets the dialog's focus, so answer only
+            // once the dialog has been on screen for a moment.
+            options = options
+                .with_send_on_substring(trigger, keys)
+                .with_send_trigger_delay(CLAUDE_DIALOG_ANSWER_DELAY_SECS);
         }
         if !probe.script_retry_delays_secs.is_empty() {
             options = options.with_script_retries(
