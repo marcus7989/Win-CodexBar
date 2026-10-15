@@ -322,16 +322,28 @@ fn redact_secrets_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Providers shown by `config providers`.
+///
+/// Same rule as the settings UI: a deprecated provider is listed only while
+/// it is still enabled in settings.
+fn listed_providers(settings: &Settings) -> Vec<ProviderId> {
+    ProviderId::all()
+        .iter()
+        .copied()
+        .filter(|id| !id.is_deprecated() || settings.is_provider_enabled(*id))
+        .collect()
+}
+
 /// List provider enabled state.
 async fn list_providers() -> anyhow::Result<()> {
     let settings = Settings::load();
-    for id in ProviderId::all() {
-        let state = if settings.is_provider_enabled(*id) {
+    for id in listed_providers(&settings) {
+        let state = if settings.is_provider_enabled(id) {
             "enabled"
         } else {
             "disabled"
         };
-        let default_marker = if instantiate_provider(*id).metadata().default_enabled {
+        let default_marker = if instantiate_provider(id).metadata().default_enabled {
             " default"
         } else {
             ""
@@ -478,10 +490,11 @@ async fn show_paths() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigFileError, read_json_config, sanitize_settings_for_dump};
+    use super::{ConfigFileError, listed_providers, read_json_config, sanitize_settings_for_dump};
+    use crate::core::ProviderId;
     #[cfg(windows)]
     use crate::secure_file;
-    use crate::settings::ManualCookies;
+    use crate::settings::{ManualCookies, Settings};
     use serde_json::json;
 
     #[cfg(windows)]
@@ -592,5 +605,32 @@ mod tests {
         assert_eq!(out, raw);
         assert_eq!(out["api_key"], "keep-me");
         assert_eq!(out["nested"]["token"], "also-keep");
+    }
+
+    #[test]
+    fn listed_providers_hides_deprecated_providers_by_default() {
+        let listed = listed_providers(&Settings::default());
+
+        assert!(!listed.contains(&ProviderId::KimiK2));
+        assert!(!listed.contains(&ProviderId::CrossModel));
+        for id in ProviderId::all() {
+            assert_eq!(
+                listed.contains(id),
+                !id.is_deprecated(),
+                "unexpected listing for {}",
+                id.cli_name()
+            );
+        }
+    }
+
+    #[test]
+    fn listed_providers_keeps_deprecated_provider_enabled_in_settings() {
+        let mut settings = Settings::default();
+        settings.enable_provider(ProviderId::KimiK2);
+
+        let listed = listed_providers(&settings);
+
+        assert!(listed.contains(&ProviderId::KimiK2));
+        assert!(!listed.contains(&ProviderId::CrossModel));
     }
 }
