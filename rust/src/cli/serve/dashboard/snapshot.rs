@@ -500,26 +500,13 @@ fn make_pace(usage: &UsageSnapshot) -> Option<ProviderPacePayload> {
 /// Upstream `PacePayload` mapping: rounded percents, camelCase stage names.
 fn pace_payload(pace: &UsagePace) -> PacePayload {
     PacePayload {
-        stage: pace_stage_name(pace.stage).to_string(),
+        stage: pace.stage.wire_name().to_string(),
         delta_percent: pace.delta_percent.round(),
         expected_used_percent: pace.expected_used_percent.round(),
         will_last_to_reset: pace.will_last_to_reset,
         eta_seconds: pace.eta_seconds.map(|eta| eta.round()),
         run_out_probability: None,
         summary: pace.format_status(),
-    }
-}
-
-/// Local stage names match upstream `UsagePace.Stage` exactly (camelCase).
-fn pace_stage_name(stage: crate::core::PaceStage) -> &'static str {
-    match stage {
-        crate::core::PaceStage::OnTrack => "onTrack",
-        crate::core::PaceStage::SlightlyAhead => "slightlyAhead",
-        crate::core::PaceStage::Ahead => "ahead",
-        crate::core::PaceStage::FarAhead => "farAhead",
-        crate::core::PaceStage::SlightlyBehind => "slightlyBehind",
-        crate::core::PaceStage::Behind => "behind",
-        crate::core::PaceStage::FarBehind => "farBehind",
     }
 }
 
