@@ -30,14 +30,7 @@ pub enum ConfigCommand {
         show_secrets: bool,
     },
     /// List providers and enabled state
-    Providers {
-        /// Emit JSON instead of text
-        #[arg(long)]
-        json: bool,
-        /// Pretty-print JSON output
-        #[arg(long)]
-        pretty: bool,
-    },
+    Providers,
     /// Allow or stop reading Claude Code's own credentials for Claude usage
     ClaudeConsent {
         /// on or off
@@ -80,7 +73,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             format,
             show_secrets,
         } => dump_config(&format, show_secrets).await,
-        ConfigCommand::Providers { json, pretty } => list_providers(json, pretty).await,
+        ConfigCommand::Providers => list_providers().await,
         ConfigCommand::ClaudeConsent { state } => set_claude_consent(state == "on").await,
         ConfigCommand::Enable { provider } => set_provider_enabled(&provider, true).await,
         ConfigCommand::Disable { provider } => set_provider_enabled(&provider, false).await,
@@ -337,29 +330,8 @@ fn redact_secrets_value(value: serde_json::Value) -> serde_json::Value {
 }
 
 /// List provider enabled state.
-async fn list_providers(json: bool, pretty: bool) -> anyhow::Result<()> {
+async fn list_providers() -> anyhow::Result<()> {
     let settings = Settings::load();
-    if json {
-        let rows: Vec<serde_json::Value> = ProviderId::all()
-            .iter()
-            .map(|id| {
-                serde_json::json!({
-                    "id": id.cli_name(),
-                    "displayName": id.display_name(),
-                    "enabled": settings.is_provider_enabled(*id),
-                    "defaultEnabled": instantiate_provider(*id).metadata().default_enabled,
-                })
-            })
-            .collect();
-        let out = if pretty {
-            serde_json::to_string_pretty(&rows)?
-        } else {
-            serde_json::to_string(&rows)?
-        };
-        println!("{out}");
-        return Ok(());
-    }
-
     for id in ProviderId::all() {
         let state = if settings.is_provider_enabled(*id) {
             "enabled"
@@ -382,7 +354,6 @@ async fn list_providers(json: bool, pretty: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Enable or disable a provider by CLI name.
 async fn set_claude_consent(allowed: bool) -> anyhow::Result<()> {
     let mut settings = Settings::load();
     settings.claude_allow_reading_claude_code_credentials = allowed;
@@ -391,6 +362,7 @@ async fn set_claude_consent(allowed: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Enable or disable a provider by CLI name.
 async fn set_provider_enabled(provider: &str, enabled: bool) -> anyhow::Result<()> {
     let id = parse_provider(provider)?;
     let mut settings = Settings::load();

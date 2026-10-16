@@ -12,7 +12,7 @@ use crate::cost_scanner::{self, CostScanner};
 
 use super::json_response;
 
-pub async fn usage_response(provider: Option<&str>, web_timeout: u64) -> String {
+pub async fn usage_response(provider: Option<&str>) -> String {
     let selection = match ProviderSelection::from_arg(provider) {
         Ok(selection) => selection,
         Err(error) => {
@@ -22,7 +22,7 @@ pub async fn usage_response(provider: Option<&str>, web_timeout: u64) -> String 
     let ctx = FetchContext {
         source_mode: SourceMode::Auto,
         include_credits: true,
-        web_timeout,
+        web_timeout: 60,
         verbose: false,
         manual_cookie_header: None,
         api_key: None,

@@ -74,10 +74,6 @@ pub struct ServeArgs {
     #[arg(long = "refresh-interval", default_value = "60")]
     pub refresh_interval: u64,
 
-    /// Per-request web fetch timeout in seconds for /usage (default 60, range 1-600)
-    #[arg(long = "request-timeout")]
-    pub request_timeout: Option<u64>,
-
     /// Bearer token for /usage and /cost (prefer CODEXBAR_DASHBOARD_TOKEN)
     #[arg(long = "dashboard-token", env = "CODEXBAR_DASHBOARD_TOKEN")]
     pub dashboard_token: Option<String>,
@@ -103,8 +99,6 @@ struct ServeConfig {
     /// [`HEAD_READ_TIMEOUT`]; tests inject a short budget (upstream 0.48.0
     /// #2684 makes the deadline injectable for exactly this reason).
     head_read_budget: Duration,
-    /// Per-request web fetch timeout in seconds for /usage.
-    request_timeout: u64,
     /// Dashboard snapshot identity mode. `None` means follow the app's
     /// `hide_personal_info` setting per request (upstream 0.50.1 #2960).
     identity: Option<DashboardIdentity>,
@@ -198,18 +192,11 @@ fn validate_serve_args(args: &ServeArgs) -> anyhow::Result<ServeConfig> {
         anyhow::bail!("{err}");
     }
 
-    if args
-        .request_timeout
-        .is_some_and(|secs| !(1..=600).contains(&secs))
-    {
-        anyhow::bail!("--request-timeout must be between 1 and 600 seconds.");
-    }
     Ok(ServeConfig {
         host,
         port: args.port,
         token_digest: token.as_ref().map(|t| sha256_digest(t.as_bytes())),
         head_read_budget: HEAD_READ_TIMEOUT,
-        request_timeout: args.request_timeout.unwrap_or(60),
         identity,
         dashboard: None,
     })
@@ -516,7 +503,7 @@ async fn route_request(request: &ServeRequest, config: &ServeConfig) -> String {
             ) {
                 return unauthorized_response();
             }
-            data::usage_response(provider.as_deref(), config.request_timeout).await
+            data::usage_response(provider.as_deref()).await
         }
         ServeRoute::Cost { provider } => {
             if !authorize_request(
