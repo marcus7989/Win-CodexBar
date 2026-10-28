@@ -1,14 +1,15 @@
 //! Windsurf provider implementation.
 //!
 //! Reads Windsurf's cached plan information from its VS Code-style SQLite
-//! state database. On Windows this defaults to
-//! `%APPDATA%\Windsurf\User\globalStorage\state.vscdb`.
+//! state database. Devin Desktop (the renamed Windsurf) writes to
+//! `%APPDATA%\Devin\User\globalStorage\state.vscdb`; the old
+//! `%APPDATA%\Windsurf\...` database is read only when no Devin one exists.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, types::Value as SqlValue};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::core::{
     FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
@@ -16,6 +17,8 @@ use crate::core::{
 };
 
 const STATE_KEY: &str = "windsurf.settings.cachedPlanInfo";
+/// Devin Desktop keeps one flat plan cache per account under this prefix.
+const DEVIN_STATE_KEY_PREFIX: &str = "windsurf.reactSettings.cachedPlanInfoData:";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +27,9 @@ struct CachedPlanInfo {
     end_timestamp: Option<i64>,
     usage: Option<WindsurfUsage>,
     quota_usage: Option<QuotaUsage>,
+    // Devin Desktop's flat format.
+    remaining_messages: Option<i64>,
+    total_messages: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,18 +83,28 @@ impl WindsurfProvider {
         {
             return Some(PathBuf::from(path));
         }
-        dirs::data_dir().map(|base| {
-            base.join("Windsurf")
+        dirs::data_dir().map(|base| Self::db_path_in(&base))
+    }
+
+    fn db_path_in(base: &Path) -> PathBuf {
+        let state_db = |folder: &str| {
+            base.join(folder)
                 .join("User")
                 .join("globalStorage")
                 .join("state.vscdb")
-        })
+        };
+        let devin = state_db("Devin");
+        if devin.exists() {
+            devin
+        } else {
+            state_db("Windsurf")
+        }
     }
 
     fn read_cached_plan(db_path: PathBuf) -> Result<CachedPlanInfo, ProviderError> {
         if !db_path.exists() {
             return Err(ProviderError::NotInstalled(format!(
-                "Windsurf database not found at {}. Open Windsurf and sign in first.",
+                "Windsurf database not found at {}. Open Devin Desktop (or Windsurf) and sign in first.",
                 db_path.display()
             )));
         }
@@ -100,18 +116,29 @@ impl WindsurfProvider {
                 ProviderError::Other(format!("Failed to configure SQLite timeout: {e}"))
             })?;
 
-        let value: SqlValue = conn
-            .query_row(
-                "SELECT value FROM ItemTable WHERE key = ?1 LIMIT 1",
-                [STATE_KEY],
-                |row| row.get(0),
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => ProviderError::AuthRequired,
-                other => {
-                    ProviderError::Other(format!("Failed to read Windsurf plan cache: {other}"))
-                }
+        let values = conn
+            .prepare("SELECT value FROM ItemTable WHERE key = ?1 OR key LIKE ?2")
+            .and_then(|mut stmt| {
+                stmt.query_map([STATE_KEY, &format!("{DEVIN_STATE_KEY_PREFIX}%")], |row| {
+                    row.get::<_, SqlValue>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| {
+                ProviderError::Other(format!("Failed to read Windsurf plan cache: {e}"))
             })?;
+        // Which cached account is signed in is not recorded next to the cache,
+        // so several of them stay unavailable instead of being guessed.
+        let [value] = <[SqlValue; 1]>::try_from(values).map_err(|values| {
+            if values.is_empty() {
+                ProviderError::AuthRequired
+            } else {
+                ProviderError::Other(
+                    "Windsurf plan cache holds several accounts; cannot tell which is active"
+                        .to_string(),
+                )
+            }
+        })?;
 
         let json_text = decode_json_value(value).ok_or_else(|| {
             ProviderError::Parse("Windsurf plan cache is not valid UTF-8/UTF-16 JSON".to_string())
@@ -173,6 +200,15 @@ impl WindsurfProvider {
                 }
                 return Ok(with_identity(snapshot, plan.plan_name, plan.end_timestamp));
             }
+        }
+
+        if primary.is_none() {
+            primary = usage_window(
+                None,
+                plan.remaining_messages,
+                plan.total_messages,
+                "messages",
+            );
         }
 
         if primary.is_none() && secondary.is_none() {
@@ -329,6 +365,8 @@ mod tests {
                 daily_reset_at_unix: None,
                 weekly_reset_at_unix: None,
             }),
+            remaining_messages: None,
+            total_messages: None,
         })
         .expect("snapshot");
 
@@ -389,6 +427,8 @@ mod missing_usage_tests {
             end_timestamp: None,
             usage,
             quota_usage,
+            remaining_messages: None,
+            total_messages: None,
         }
     }
 
@@ -427,5 +467,138 @@ mod missing_usage_tests {
         .expect("snapshot");
         assert!(!snapshot.primary.is_informational);
         assert_eq!(snapshot.primary.used_percent, 0.0);
+    }
+}
+
+/// Provisional: the flat Devin Desktop format is taken from the Devin Desktop
+/// 3.11.228 package (key and field names), not from a signed-in Windows
+/// database. Value types and the meaning of the totals are unconfirmed.
+#[cfg(test)]
+mod devin_cache_tests {
+    use super::*;
+    use std::path::Path;
+
+    const DEVIN_KEY_PREFIX: &str = "windsurf.reactSettings.cachedPlanInfoData:";
+
+    fn state_db(base: &Path, folder: &str, rows: &[(&str, &str)]) -> PathBuf {
+        let dir = base.join(folder).join("User").join("globalStorage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.vscdb");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+            [],
+        )
+        .unwrap();
+        for (key, value) in rows {
+            conn.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+                [key, value],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    fn read(path: PathBuf) -> Result<UsageSnapshot, ProviderError> {
+        WindsurfProvider::read_cached_plan(path).and_then(WindsurfProvider::snapshot_from_plan)
+    }
+
+    #[test]
+    fn flat_message_counters_become_the_primary_quota() {
+        let base = tempfile::tempdir().unwrap();
+        let path = state_db(
+            base.path(),
+            "Devin",
+            &[(
+                &format!("{DEVIN_KEY_PREFIX}user-1"),
+                r#"{"planName":"Pro","endTimestamp":1800000000000,"remainingMessages":40,"totalMessages":100}"#,
+            )],
+        );
+
+        let snapshot = read(path).expect("snapshot");
+
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(snapshot.primary.used_percent, 60.0);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("60 / 100 messages")
+        );
+        assert!(snapshot.primary.resets_at.is_none());
+        assert!(snapshot.secondary.is_none());
+        assert_eq!(snapshot.login_method.as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn flat_cache_without_a_message_total_is_an_error() {
+        for json in [
+            r#"{"planName":"Pro"}"#,
+            r#"{"planName":"Pro","remainingMessages":40}"#,
+            r#"{"planName":"Pro","totalMessages":100}"#,
+            r#"{"planName":"Pro","totalMessages":0,"remainingMessages":0}"#,
+            r#"{"planName":"Pro","acuConsumed":3.5,"acuLimit":10,"dollarsConsumed":1,"dollarsLimit":20}"#,
+        ] {
+            let base = tempfile::tempdir().unwrap();
+            let path = state_db(
+                base.path(),
+                "Devin",
+                &[(&format!("{DEVIN_KEY_PREFIX}user-1"), json)],
+            );
+            assert!(read(path).is_err(), "must not invent a quota for {json}");
+        }
+    }
+
+    #[test]
+    fn several_account_caches_are_not_guessed() {
+        let base = tempfile::tempdir().unwrap();
+        let flat = r#"{"planName":"Pro","remainingMessages":40,"totalMessages":100}"#;
+        let path = state_db(
+            base.path(),
+            "Devin",
+            &[
+                (&format!("{DEVIN_KEY_PREFIX}user-1"), flat),
+                (&format!("{DEVIN_KEY_PREFIX}user-2"), flat),
+            ],
+        );
+
+        assert!(WindsurfProvider::read_cached_plan(path).is_err());
+    }
+
+    #[test]
+    fn devin_database_without_a_plan_cache_needs_sign_in() {
+        let base = tempfile::tempdir().unwrap();
+        let path = state_db(base.path(), "Devin", &[("something.else", "{}")]);
+
+        assert!(matches!(
+            WindsurfProvider::read_cached_plan(path),
+            Err(ProviderError::AuthRequired)
+        ));
+    }
+
+    #[test]
+    fn the_legacy_windsurf_cache_still_reads() {
+        let base = tempfile::tempdir().unwrap();
+        let path = state_db(
+            base.path(),
+            "Windsurf",
+            &[(
+                STATE_KEY,
+                r#"{"planName":"Pro","usage":{"messages":100,"usedMessages":10}}"#,
+            )],
+        );
+
+        let snapshot = read(path).expect("snapshot");
+
+        assert_eq!(snapshot.primary.used_percent, 10.0);
+    }
+
+    #[test]
+    fn the_devin_folder_wins_over_the_legacy_windsurf_folder() {
+        let base = tempfile::tempdir().unwrap();
+        let legacy = state_db(base.path(), "Windsurf", &[]);
+        assert_eq!(WindsurfProvider::db_path_in(base.path()), legacy);
+
+        let devin = state_db(base.path(), "Devin", &[]);
+        assert_eq!(WindsurfProvider::db_path_in(base.path()), devin);
     }
 }
