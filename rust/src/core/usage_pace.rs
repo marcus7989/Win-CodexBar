@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 
-use super::{ProviderId, RateWindow, SESSION_WINDOW_MINUTES, UsageSnapshot, WEEKLY_WINDOW_MINUTES};
+use super::{ProviderId, RateWindow, SESSION_WINDOW_MINUTES, UsageSnapshot};
 
 /// CodexBar's CLI leaves the pace out until this much of the window has
 /// elapsed (upstream `CLIRenderer.paceMinimumExpectedPercent`).
@@ -264,9 +264,11 @@ impl UsagePace {
         if window.is_informational || window.used_percent >= 100.0 {
             return None;
         }
+        // A weekly lane keeps the length its provider reports; with none
+        // there is no pace, as CodexBar leaves out a window of unknown length.
         let default_minutes = match kind {
             PaceKind::Session => SESSION_WINDOW_MINUTES,
-            PaceKind::Weekly => WEEKLY_WINDOW_MINUTES,
+            PaceKind::Weekly => window.window_minutes?,
         };
         let pace = Self::weekly(window, now, default_minutes)?;
         (pace.expected_used_percent >= WIRE_MINIMUM_EXPECTED_PERCENT).then_some(pace)
@@ -660,5 +662,15 @@ mod tests {
         // No reset anywhere: no `pace` at all.
         let bare = UsageSnapshot::new(RateWindow::new(40.0)).with_secondary(RateWindow::new(40.0));
         assert!(provider_pace_json(ProviderId::Codex, &bare, Some(now)).is_none());
+    }
+
+    #[test]
+    fn provider_pace_json_leaves_out_a_weekly_window_of_unknown_length() {
+        // Cursor Auto: the billing period's end is known, its length is not.
+        let now = at("2026-09-21T08:00:00Z");
+        let cursor = UsageSnapshot::new(RateWindow::new(10.0)).with_secondary(
+            RateWindow::with_details(40.0, None, Some(now + Duration::days(3)), None),
+        );
+        assert!(provider_pace_json(ProviderId::Cursor, &cursor, Some(now)).is_none());
     }
 }

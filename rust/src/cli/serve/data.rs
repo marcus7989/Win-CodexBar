@@ -75,13 +75,37 @@ fn usage_item(
     let mut item = json!({
         "provider": provider_id.cli_name(),
         "source": result.source_label,
-        "usage": result.usage,
+        "usage": camel_case_keys(json!(result.usage)),
         "cost": result.cost,
     });
     if let Some(pace) = provider_pace_json(provider_id, &result.usage, now) {
         item["pace"] = pace;
     }
     item
+}
+
+/// CodexBar names the keys of `usage` in camelCase (`usedPercent`,
+/// `resetsAt`); VibeTV pairs a `pace` with its window by those names.
+fn camel_case_keys(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let mut words = key.split('_');
+                    let mut camel = words.next().unwrap_or_default().to_string();
+                    for word in words {
+                        let mut chars = word.chars();
+                        camel.extend(chars.next().map(|c| c.to_ascii_uppercase()));
+                        camel.push_str(chars.as_str());
+                    }
+                    (camel, camel_case_keys(value))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(camel_case_keys).collect()),
+        other => other,
+    }
 }
 
 pub async fn cost_response(provider: Option<&str>) -> String {
@@ -239,6 +263,24 @@ mod tests {
         );
         assert_eq!(item["provider"], "claude");
         assert!(item["usage"].is_object());
+    }
+
+    #[test]
+    fn usage_item_names_the_usage_windows_as_the_mac_serve_does() {
+        // The pace is only usable beside the window it belongs to; VibeTV
+        // matches the two by `usage.<lane>.resetsAt`.
+        let (recorded, result, now) = recorded_entry("claude");
+        let item = usage_item(ProviderId::Claude, &result, Some(now));
+        for lane in ["primary", "secondary"] {
+            let (got, want) = (&item["usage"][lane], &recorded["usage"][lane]);
+            // 8 and 8.0 are one value; the recording writes whole numbers.
+            assert_eq!(got["usedPercent"].as_f64(), want["usedPercent"].as_f64());
+            for field in ["windowMinutes", "resetsAt"] {
+                assert_eq!(got[field], want[field], "{lane}.{field}");
+            }
+        }
+        assert!(item["usage"]["updatedAt"].is_string());
+        assert!(item["usage"]["secondary"].get("resets_at").is_none());
     }
 
     #[test]
