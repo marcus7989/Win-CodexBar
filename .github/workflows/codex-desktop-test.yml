@@ -28,7 +28,7 @@ jobs:
         with:
           toolchain: 1.98.0
           components: rustfmt
-      - name: Native original Desktop tests with fixture diagnostics
+      - name: Native red-green proof on main, PR base, .16 and PR20
         run: |
           @'
           import pathlib, subprocess, os, json
@@ -42,10 +42,10 @@ jobs:
           version = "0.1.0"
           edition = "2024"
           [dependencies]
-          base64 = "0.22.1"
-          dirs = "6.0.0"
-          thiserror = "2.0.18"
-          tempfile = "3.26.0"
+          base64 = "=0.22.1"
+          dirs = "=6.0.0"
+          thiserror = "=2.0.18"
+          tempfile = "=3.27.0"
           ''')
           (harness / 'src' / 'lib.rs').write_text('pub mod codex_accounts { pub mod file_locations; pub mod codex_desktop; }')
           refs = {
@@ -55,6 +55,8 @@ jobs:
               'pr20': 'ba43f0d2113aeb6ded6490399eff729fd770bd4c',
           }
           results = []
+          fixed = (root / 'rust/src/codex_accounts/codex_desktop.rs').read_text()
+          assert '$fixturePackage = [System.IO.Path]::GetFullPath({package})' in fixed
           for label, ref in refs.items():
               for name in ['file_locations', 'codex_desktop']:
                   source = subprocess.check_output(['git', 'show', f'{ref}:rust/src/codex_accounts/{name}.rs']).decode()
@@ -63,6 +65,7 @@ jobs:
                       new = '"exit={:?} stdout={} stderr={} fixture_log={}",\n            output.status.code(),\n            String::from_utf8_lossy(&output.stdout),\n            String::from_utf8_lossy(&output.stderr),\n            std::fs::read_to_string(dir.path().join("support/codex-desktop-restart.log")).unwrap_or_default()'
                       assert source.count(old) == 1
                       source = source.replace(old, new)
+                      source = source.replace("throw 'Wrong launcher'", "throw ('Wrong launcher actual=[' + $FilePath + '] expected=[' + (Join-Path $fixturePackage 'app\\ChatGPT.exe') + ']')")
                   (harness / 'src' / 'codex_accounts' / f'{name}.rs').write_text(source)
               command = ['cargo', 'test', '--manifest-path', str(harness / 'Cargo.toml'), 'restart_uses_manifest_gui_and_leaves_standalone_cli_alone', '--', '--nocapture']
               process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -70,11 +73,23 @@ jobs:
               print(process.stdout, flush=True)
               (out / f'{label}.log').write_text(process.stdout)
               results.append(dict(label=label, ref=ref, exit=process.returncode))
+              assert process.returncode == 101 and 'Restart failed: Wrong launcher' in process.stdout, 'Expected path-mismatch baseline failure'
+              (harness / 'src' / 'codex_accounts' / 'codex_desktop.rs').write_text(fixed)
+              process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(f'FIXED {label} {ref} exit={process.returncode}', flush=True)
+              print(process.stdout, flush=True)
+              (out / f'{label}-fixed.log').write_text(process.stdout)
+              results.append(dict(label=label + '-fixed', ref=ref, exit=process.returncode))
+              assert process.returncode == 0, 'Fixed Desktop fixture failed'
           (out / 'results.json').write_text(json.dumps(results, indent=2))
-          if any(row['exit'] != 0 for row in results):
-              raise SystemExit('Native baseline failures recorded; inspect fixture_log')
           '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw 'Baseline failures; inspect fixture log' }
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop red-green proof failed' }
+      - name: Full library suite at this exact PR head
+        run: |
+          cargo fmt --all --check
+          if ($LASTEXITCODE -ne 0) { throw 'Rust format failed' }
+          cargo test -p codexbar --lib --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Full library suite failed' }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
