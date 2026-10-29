@@ -1,0 +1,86 @@
+name: Codex Desktop restart regression
+on:
+  push:
+    branches: [codex/w296-desktop-restart-test]
+    paths:
+      - .github/workflows/codex-desktop-test.yml
+      - rust/src/codex_accounts/codex_desktop.rs
+permissions:
+  contents: read
+jobs:
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - name: Native original Desktop tests with fixture diagnostics
+        run: |
+          @'
+          import pathlib, subprocess, os, json
+          root = pathlib.Path.cwd()
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'desktop-proof'
+          out.mkdir()
+          harness = out / 'harness'
+          (harness / 'src' / 'codex_accounts').mkdir(parents=True)
+          (harness / 'Cargo.toml').write_text('''[package]
+          name = "desktop-proof"
+          version = "0.1.0"
+          edition = "2024"
+          [dependencies]
+          base64 = "0.22.1"
+          dirs = "6.0.0"
+          thiserror = "2.0.18"
+          tempfile = "3.26.0"
+          ''')
+          (harness / 'src' / 'lib.rs').write_text('pub mod codex_accounts { pub mod file_locations; pub mod codex_desktop; }')
+          refs = {
+              'main': '2634b666549a33da3c9cd8aa18d661dc702fa83a',
+              'vibetv-base': '935b98b118f1599c191ccf2754a6f352d806ffac',
+              'pr19-dot16': 'b1174a1010cc2f1af572429a486ef42a4929be65',
+              'pr20': 'ba43f0d2113aeb6ded6490399eff729fd770bd4c',
+          }
+          results = []
+          for label, ref in refs.items():
+              for name in ['file_locations', 'codex_desktop']:
+                  source = subprocess.check_output(['git', 'show', f'{ref}:rust/src/codex_accounts/{name}.rs']).decode()
+                  if name == 'codex_desktop':
+                      old = '"{}",\n            String::from_utf8_lossy(&output.stderr)'
+                      new = '"exit={:?} stdout={} stderr={} fixture_log={}",\n            output.status.code(),\n            String::from_utf8_lossy(&output.stdout),\n            String::from_utf8_lossy(&output.stderr),\n            std::fs::read_to_string(dir.path().join("support/codex-desktop-restart.log")).unwrap_or_default()'
+                      assert source.count(old) == 1
+                      source = source.replace(old, new)
+                  (harness / 'src' / 'codex_accounts' / f'{name}.rs').write_text(source)
+              command = ['cargo', 'test', '--manifest-path', str(harness / 'Cargo.toml'), 'restart_uses_manifest_gui_and_leaves_standalone_cli_alone', '--', '--nocapture']
+              process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(f'BASELINE {label} {ref} exit={process.returncode}', flush=True)
+              print(process.stdout, flush=True)
+              (out / f'{label}.log').write_text(process.stdout)
+              results.append(dict(label=label, ref=ref, exit=process.returncode))
+          (out / 'results.json').write_text(json.dumps(results, indent=2))
+          if any(row['exit'] != 0 for row in results):
+              raise SystemExit('Native baseline failures recorded; inspect fixture_log')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline failures; inspect fixture log' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: desktop-proof-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/desktop-proof/*.log
+            ${{ runner.temp }}/desktop-proof/results.json
+          if-no-files-found: error
+          retention-days: 14
