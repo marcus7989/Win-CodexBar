@@ -1056,41 +1056,51 @@ mod tests {
         drop(process);
     }
 
+    // Reuse the native test executable so the containment test does not time
+    // PowerShell/.NET startup while the rest of the library suite runs.
+    #[test]
+    fn managed_descendant_fixture() {
+        let Some(marker) = std::env::var_os("CODEXBAR_MANAGED_DESCENDANT_MARKER") else {
+            return;
+        };
+        if std::env::var_os("CODEXBAR_MANAGED_DESCENDANT_LEAF").is_none() {
+            use std::os::windows::process::CommandExt;
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "managed_process::tests::managed_descendant_fixture",
+                ])
+                .env("CODEXBAR_MANAGED_DESCENDANT_LEAF", "1")
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .expect("start the native descendant fixture");
+            std::fs::write(marker, child.id().to_string()).expect("write descendant pid");
+        }
+        std::thread::sleep(Duration::from_secs(120));
+    }
+
     #[tokio::test]
     async fn managed_process_contains_descendants_of_the_pty_child() {
-        let marker = std::env::temp_dir().join(format!(
-            "codexbar-managed-descendant-{}.txt",
-            std::process::id()
-        ));
-        drop(std::fs::remove_file(&marker));
-        let script = format!(
-            "$psi = New-Object System.Diagnostics.ProcessStartInfo; \
-             $psi.FileName = 'powershell.exe'; \
-             $psi.Arguments = '-NoLogo -NoProfile -Command \"Start-Sleep -Seconds 120\"'; \
-             $psi.UseShellExecute = $false; \
-             $p = [System.Diagnostics.Process]::Start($psi); \
-             Set-Content -LiteralPath '{}' -Value $p.Id; \
-             Start-Sleep -Seconds 120",
-            marker.display()
-        );
+        let directory = tempfile::tempdir().expect("isolated descendant fixture directory");
+        let marker = directory.path().join("descendant.pid");
         let config = ManagedProcessConfig {
-            program: PathBuf::from("powershell.exe"),
+            program: std::env::current_exe().expect("native test executable"),
             args: vec![
-                OsString::from("-NoLogo"),
-                OsString::from("-NoProfile"),
-                OsString::from("-NonInteractive"),
-                OsString::from("-Command"),
-                OsString::from(script),
+                OsString::from("--exact"),
+                OsString::from("managed_process::tests::managed_descendant_fixture"),
             ],
-            env: Vec::new(),
-            cwd: None,
+            env: vec![(
+                OsString::from("CODEXBAR_MANAGED_DESCENDANT_MARKER"),
+                marker.as_os_str().to_owned(),
+            )],
+            cwd: Some(directory.path().to_owned()),
             pty_rows: 30,
             pty_cols: 120,
             label: "test-descendant".to_string(),
         };
-        let process = ManagedProcess::spawn(&config).expect("start a managed test process");
+        let mut process = ManagedProcess::spawn(&config).expect("start a managed test process");
 
-        let descendant = wait_for_descendant_pid(&marker);
+        let descendant = wait_for_descendant_pid(&marker, &mut process);
         assert!(
             process_is_alive(descendant),
             "the descendant of the PTY child should be running before shutdown"
@@ -1099,10 +1109,9 @@ mod tests {
         process.shutdown(Duration::from_secs(10)).await;
 
         wait_for_exit_within(descendant, Duration::from_secs(10));
-        drop(std::fs::remove_file(&marker));
     }
 
-    fn wait_for_descendant_pid(marker: &Path) -> u32 {
+    fn wait_for_descendant_pid(marker: &Path, process: &mut ManagedProcess) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Ok(contents) = std::fs::read_to_string(marker)
@@ -1111,8 +1120,18 @@ mod tests {
                 return pid;
             }
             assert!(
+                process
+                    .try_wait()
+                    .expect("poll descendant fixture")
+                    .is_none(),
+                "PTY fixture exited before reporting its descendant pid"
+            );
+            assert!(
                 Instant::now() < deadline,
-                "the PTY child did not report a descendant pid"
+                "PTY fixture {} did not report a descendant pid at {}: {:?}",
+                process.pid(),
+                marker.display(),
+                std::fs::read_to_string(marker)
             );
             std::thread::sleep(Duration::from_millis(50));
         }
