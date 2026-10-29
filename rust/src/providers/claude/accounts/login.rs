@@ -582,23 +582,30 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"test","organizationUuid":"org","emailAddress":"test@example.com"}}"#).unwrap();
+        // This test covers exit handling and credential isolation, not shell
+        // startup speed. Reap each fixture before starting the login deadline;
+        // cancelled_and_timed_out_logins_reap_child covers a running process.
+        let mut successful_child = child(dir.path(), false, 0);
+        assert!(successful_child.wait().unwrap().success());
         let login = wait_for_login(
-            &mut child(dir.path(), false, 0),
+            &mut successful_child,
             dir.path(),
             &AtomicBool::new(false),
-            Duration::from_secs(10),
+            Duration::ZERO,
         )
         .unwrap();
         assert_eq!(login.id().unwrap(), "test:org");
-        assert!(
-            wait_for_login(
-                &mut child(dir.path(), false, 1),
-                dir.path(),
-                &AtomicBool::new(false),
-                Duration::from_secs(10)
-            )
-            .is_err()
-        );
+        let mut failed_child = child(dir.path(), false, 1);
+        assert_eq!(failed_child.wait().unwrap().code(), Some(1));
+        let error = wait_for_login(
+            &mut failed_child,
+            dir.path(),
+            &AtomicBool::new(false),
+            Duration::ZERO,
+        )
+        .err()
+        .expect("a failed login process must be rejected");
+        assert!(error.to_string().contains("exit code 1"));
     }
 
     #[test]
