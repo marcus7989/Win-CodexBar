@@ -1,0 +1,77 @@
+name: W307 isolated Windows full suite
+on:
+  push:
+    branches: [codex/w307-ci]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact cumulative vibetv commit after integration (full 40-character SHA)
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  windows:
+    name: Windows / ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: >-
+          ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"label": "fixtures", "sha": "e749083ad573fed8815c204c60e2a5824af944a0"}]' || '[{"label": "pr21-exact", "sha": "c8e11559ed78df845a1ee732e511025b458d1320"}, {"label": "fixtures", "sha": "e749083ad573fed8815c204c60e2a5824af944a0"}, {"label": "all-four", "sha": "ef4aace55a59ed61fc66ab9b7d341129b82afa69"}]') }}
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTFLAGS: -C target-feature=+crt-static
+      EXPECTED_SOURCE: ${{ inputs.source_sha || matrix.sha }}
+      PROOF_LABEL: ${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha || matrix.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      - name: Exact source and full locked backend CLI and doc suite
+        run: |
+          @'
+          import datetime, json, os, pathlib, re, subprocess
+          root = pathlib.Path.cwd()
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'w307-proof'
+          out.mkdir()
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert re.fullmatch('[0-9a-f]{40}', os.environ['EXPECTED_SOURCE'])
+          assert sha == os.environ['EXPECTED_SOURCE'], (sha, os.environ['EXPECTED_SOURCE'])
+          assert not (root / '.github/workflows/codex-desktop-test.yml').exists()
+          manifest = dict(source_sha=sha, label=os.environ['PROOF_LABEL'], workflow_sha=os.environ['GITHUB_SHA'], run_id=os.environ['GITHUB_RUN_ID'], started=datetime.datetime.now(datetime.timezone.utc).isoformat(), rustflags=os.environ['RUSTFLAGS'], commands=[])
+          commands = [
+              ['rustc', '--version'],
+              ['cargo', 'fmt', '--all', '--check'],
+              ['cargo', 'test', '-p', 'codexbar', '--locked', '--target', 'x86_64-pc-windows-msvc'],
+          ]
+          for index, command in enumerate(commands):
+              print('RUN', command, flush=True)
+              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', timeout=1500)
+              print(result.stdout, flush=True)
+              (out / f'{index}.log').write_text(result.stdout, encoding='utf-8')
+              manifest['commands'].append(dict(command=command, exit=result.returncode, summaries=re.findall(r'test result: .*', result.stdout)))
+              (out / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+              assert result.returncode == 0, f'Failed: {command}'
+          manifest['completed'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+          (out / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'W307 full suite failed' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: w307-${{ matrix.label }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/w307-proof/
+          if-no-files-found: error
+          retention-days: 14
