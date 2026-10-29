@@ -343,7 +343,10 @@ fn with_identity(
     if let Some(plan) = plan_name.filter(|v| !v.trim().is_empty()) {
         snapshot = snapshot.with_login_method(plan);
     }
-    if let Some(end) = end_timestamp.and_then(DateTime::<Utc>::from_timestamp_millis) {
+    if let Some(end) = end_timestamp
+        .filter(|ts| *ts > 0)
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+    {
         snapshot = snapshot.with_organization(format!("Expires {}", end.format("%Y-%m-%d")));
     }
     snapshot
@@ -527,6 +530,10 @@ mod devin_cache_tests {
         assert!(snapshot.primary.resets_at.is_none());
         assert!(snapshot.secondary.is_none());
         assert_eq!(snapshot.login_method.as_deref(), Some("Pro"));
+        assert_eq!(
+            snapshot.account_organization.as_deref(),
+            Some("Expires 2027-01-15")
+        );
     }
 
     #[test]
@@ -546,6 +553,40 @@ mod devin_cache_tests {
             );
             assert!(read(path).is_err(), "must not invent a quota for {json}");
         }
+    }
+
+    #[test]
+    fn flat_cache_with_zero_end_timestamp_has_no_expiry() {
+        let base = tempfile::tempdir().unwrap();
+        let path = state_db(
+            base.path(),
+            "Devin",
+            &[(
+                &format!("{DEVIN_KEY_PREFIX}user-1"),
+                r#"{"planName":"Pro","endTimestamp":0,"remainingMessages":2500,"totalMessages":2500}"#,
+            )],
+        );
+
+        let snapshot = read(path).expect("snapshot");
+
+        assert_eq!(snapshot.account_organization, None);
+    }
+
+    #[test]
+    fn flat_cache_with_negative_end_timestamp_has_no_expiry() {
+        let base = tempfile::tempdir().unwrap();
+        let path = state_db(
+            base.path(),
+            "Devin",
+            &[(
+                &format!("{DEVIN_KEY_PREFIX}user-1"),
+                r#"{"planName":"Pro","endTimestamp":-1,"remainingMessages":2500,"totalMessages":2500}"#,
+            )],
+        );
+
+        let snapshot = read(path).expect("snapshot");
+
+        assert_eq!(snapshot.account_organization, None);
     }
 
     #[test]
