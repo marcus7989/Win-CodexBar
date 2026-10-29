@@ -586,7 +586,11 @@ mod tests {
         // startup speed. Reap each fixture before starting the login deadline;
         // cancelled_and_timed_out_logins_reap_child covers a running process.
         let mut successful_child = child(dir.path(), false, 0);
-        assert!(successful_child.wait().unwrap().success());
+        assert!(
+            wait_for_fixture(&mut successful_child, Duration::from_secs(60))
+                .unwrap()
+                .success()
+        );
         let login = wait_for_login(
             &mut successful_child,
             dir.path(),
@@ -596,7 +600,12 @@ mod tests {
         .unwrap();
         assert_eq!(login.id().unwrap(), "test:org");
         let mut failed_child = child(dir.path(), false, 1);
-        assert_eq!(failed_child.wait().unwrap().code(), Some(1));
+        assert_eq!(
+            wait_for_fixture(&mut failed_child, Duration::from_secs(60))
+                .unwrap()
+                .code(),
+            Some(1)
+        );
         let error = wait_for_login(
             &mut failed_child,
             dir.path(),
@@ -606,6 +615,40 @@ mod tests {
         .err()
         .expect("a failed login process must be rejected");
         assert!(error.to_string().contains("exit code 1"));
+    }
+
+    // This is a fixture-startup budget, not a change to the login timeout.
+    fn wait_for_fixture(
+        child: &mut LoginChild,
+        budget: Duration,
+    ) -> io::Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("login test fixture did not exit within {budget:?}; terminated"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn stalled_login_fixture_is_terminated_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = child(dir.path(), true, 0);
+        let started = Instant::now();
+        let error = wait_for_fixture(&mut child, Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("login test fixture"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let status = wait_for_fixture(&mut child, Duration::from_secs(5)).unwrap();
+        assert!(!status.success());
     }
 
     #[test]
