@@ -208,16 +208,10 @@ impl WindsurfProvider {
             && total > 0
             && (0..=total).contains(&remaining)
         {
-            // The cache field names do not prove these are literal messages or
-            // credits. Keep the raw ratio, without inventing a billing unit.
+            // Use messages to match the cached remainingMessages / totalMessages fields.
             // Reject invalid counters before subtraction/clamping can fabricate
             // a quota or overflow on malformed cache values.
-            primary = usage_window(
-                None,
-                Some(remaining),
-                Some(total),
-                "cached units (unit unverified)",
-            );
+            primary = usage_window(None, Some(remaining), Some(total), "messages");
             primary_label = Some("Cached quota");
         }
 
@@ -523,7 +517,7 @@ mod devin_cache_tests {
     }
 
     #[test]
-    fn flat_cache_counters_use_an_unverified_unit_label() {
+    fn flat_cache_counters_use_a_messages_label() {
         let base = tempfile::tempdir().unwrap();
         let path = state_db(
             base.path(),
@@ -541,7 +535,7 @@ mod devin_cache_tests {
         assert_eq!(snapshot.primary.used_percent, 60.0);
         assert_eq!(
             snapshot.primary.reset_description.as_deref(),
-            Some("60 / 100 cached units (unit unverified)")
+            Some("60 / 100 messages")
         );
         assert!(snapshot.primary.resets_at.is_none());
         assert!(snapshot.secondary.is_none());
@@ -607,7 +601,7 @@ mod devin_cache_tests {
         assert!(!snapshot.primary.is_informational);
         assert_eq!(
             snapshot.primary.reset_description.as_deref(),
-            Some("0 / 2500 cached units (unit unverified)")
+            Some("0 / 2500 messages")
         );
         assert!(snapshot.primary.resets_at.is_none());
         assert!(snapshot.primary.window_minutes.is_none());
