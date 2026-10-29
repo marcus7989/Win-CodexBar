@@ -1,0 +1,49 @@
+name: W307 native Desktop unit suite
+on:
+  push:
+    branches: [codex/w307-desktop-ci]
+permissions:
+  contents: read
+jobs:
+  desktop-tests:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ef4aace55a59ed61fc66ab9b7d341129b82afa69
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.98.0
+      - name: Full native desktop-shell unit suite at cumulative source
+        run: |
+          @'
+          import json, os, pathlib, re, subprocess
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'w307-desktop'
+          out.mkdir()
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          assert sha == 'ef4aace55a59ed61fc66ab9b7d341129b82afa69'
+          command = ['cargo', 'test', '--manifest-path', 'apps/desktop-tauri/src-tauri/Cargo.toml', '--locked', '--target', 'x86_64-pc-windows-msvc']
+          result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', timeout=1800)
+          print(result.stdout, flush=True)
+          (out / 'desktop.log').write_text(result.stdout, encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(dict(source_sha=sha, workflow_sha=os.environ['GITHUB_SHA'], run_id=os.environ['GITHUB_RUN_ID'], command=command, exit=result.returncode, summaries=re.findall(r'test result: .*', result.stdout)), indent=2), encoding='utf-8')
+          assert result.returncode == 0, 'Desktop-shell suite failed'
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'W307 Desktop unit suite failed' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: w307-desktop-${{ github.run_id }}
+          path: ${{ runner.temp }}/w307-desktop/
+          if-no-files-found: error
+          retention-days: 14
