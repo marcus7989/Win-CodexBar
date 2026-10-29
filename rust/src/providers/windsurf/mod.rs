@@ -150,6 +150,7 @@ impl WindsurfProvider {
 
     fn snapshot_from_plan(plan: CachedPlanInfo) -> Result<UsageSnapshot, ProviderError> {
         let mut primary = None;
+        let mut primary_label = None;
         let mut secondary = None;
 
         if let Some(quota) = plan.quota_usage {
@@ -202,13 +203,22 @@ impl WindsurfProvider {
             }
         }
 
-        if primary.is_none() {
+        if primary.is_none()
+            && let (Some(remaining), Some(total)) = (plan.remaining_messages, plan.total_messages)
+            && total > 0
+            && (0..=total).contains(&remaining)
+        {
+            // The cache field names do not prove these are literal messages or
+            // credits. Keep the raw ratio, without inventing a billing unit.
+            // Reject invalid counters before subtraction/clamping can fabricate
+            // a quota or overflow on malformed cache values.
             primary = usage_window(
                 None,
-                plan.remaining_messages,
-                plan.total_messages,
-                "messages",
+                Some(remaining),
+                Some(total),
+                "cached units (unit unverified)",
             );
+            primary_label = Some("Cached quota");
         }
 
         if primary.is_none() && secondary.is_none() {
@@ -219,6 +229,9 @@ impl WindsurfProvider {
         let mut snapshot = UsageSnapshot::new(primary.unwrap_or_else(|| {
             RateWindow::informational("No cached Windsurf daily quota details")
         }));
+        if let Some(label) = primary_label {
+            snapshot = snapshot.with_primary_label(label);
+        }
         if let Some(secondary) = secondary {
             snapshot = snapshot.with_secondary(secondary);
         }
@@ -473,9 +486,11 @@ mod missing_usage_tests {
     }
 }
 
-/// Provisional: the flat Devin Desktop format is taken from the Devin Desktop
-/// 3.11.228 package (key and field names), not from a signed-in Windows
-/// database. Value types and the meaning of the totals are unconfirmed.
+/// The key and flat fields come from the Devin Desktop 3.11.228 package.
+/// PR #18 also records one signed-in Windows TEXT/JSON sample with integer
+/// counters. Their billing unit and cadence remain unverified; see
+/// https://docs.devin.ai/desktop/accounts/quota and
+/// https://docs.devin.ai/desktop/accounts/usage.
 #[cfg(test)]
 mod devin_cache_tests {
     use super::*;
@@ -508,7 +523,7 @@ mod devin_cache_tests {
     }
 
     #[test]
-    fn flat_message_counters_become_the_primary_quota() {
+    fn flat_cache_counters_use_an_unverified_unit_label() {
         let base = tempfile::tempdir().unwrap();
         let path = state_db(
             base.path(),
@@ -521,11 +536,12 @@ mod devin_cache_tests {
 
         let snapshot = read(path).expect("snapshot");
 
+        assert_eq!(snapshot.primary_label.as_deref(), Some("Cached quota"));
         assert!(!snapshot.primary.is_informational);
         assert_eq!(snapshot.primary.used_percent, 60.0);
         assert_eq!(
             snapshot.primary.reset_description.as_deref(),
-            Some("60 / 100 messages")
+            Some("60 / 100 cached units (unit unverified)")
         );
         assert!(snapshot.primary.resets_at.is_none());
         assert!(snapshot.secondary.is_none());
@@ -537,13 +553,15 @@ mod devin_cache_tests {
     }
 
     #[test]
-    fn flat_cache_without_a_message_total_is_an_error() {
+    fn flat_cache_without_valid_counters_is_an_error() {
         for json in [
             r#"{"planName":"Pro"}"#,
             r#"{"planName":"Pro","remainingMessages":40}"#,
             r#"{"planName":"Pro","totalMessages":100}"#,
             r#"{"planName":"Pro","totalMessages":0,"remainingMessages":0}"#,
             r#"{"planName":"Pro","acuConsumed":3.5,"acuLimit":10,"dollarsConsumed":1,"dollarsLimit":20}"#,
+            r#"{"planName":"Pro","remainingMessages":-1,"totalMessages":100}"#,
+            r#"{"planName":"Pro","remainingMessages":101,"totalMessages":100}"#,
         ] {
             let base = tempfile::tempdir().unwrap();
             let path = state_db(
@@ -553,6 +571,21 @@ mod devin_cache_tests {
             );
             assert!(read(path).is_err(), "must not invent a quota for {json}");
         }
+    }
+
+    #[test]
+    fn flat_cache_with_overflowing_remaining_is_an_error() {
+        let base = tempfile::tempdir().unwrap();
+        let path = state_db(
+            base.path(),
+            "Devin",
+            &[(
+                &format!("{DEVIN_KEY_PREFIX}user-1"),
+                r#"{"remainingMessages":-9223372036854775808,"totalMessages":100}"#,
+            )],
+        );
+
+        assert!(read(path).is_err());
     }
 
     #[test]
@@ -570,6 +603,14 @@ mod devin_cache_tests {
         let snapshot = read(path).expect("snapshot");
 
         assert_eq!(snapshot.account_organization, None);
+        assert_eq!(snapshot.primary.used_percent, 0.0);
+        assert!(!snapshot.primary.is_informational);
+        assert_eq!(
+            snapshot.primary.reset_description.as_deref(),
+            Some("0 / 2500 cached units (unit unverified)")
+        );
+        assert!(snapshot.primary.resets_at.is_none());
+        assert!(snapshot.primary.window_minutes.is_none());
     }
 
     #[test]
@@ -631,6 +672,7 @@ mod devin_cache_tests {
         let snapshot = read(path).expect("snapshot");
 
         assert_eq!(snapshot.primary.used_percent, 10.0);
+        assert!(snapshot.primary_label.is_none());
     }
 
     #[test]
