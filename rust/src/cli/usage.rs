@@ -375,7 +375,9 @@ fn render_text_error(provider_id: ProviderId, error_msg: &str, use_color: bool) 
     format!("{}  Error: {}", header, error_msg)
 }
 
-fn render_json_result(
+/// One `/usage` item as the CLI prints it. `serve` builds its items here too,
+/// so both carry the same `pace` object.
+pub(crate) fn render_json_result(
     provider_id: ProviderId,
     result: ProviderFetchResult,
     status: Option<&StatusInfo>,

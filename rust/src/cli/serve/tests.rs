@@ -979,3 +979,39 @@ async fn snapshot_slower_than_the_deadline_answers_504_then_serves_the_finished_
     assert!(healed.starts_with("HTTP/1.1 200"), "{healed}");
     assert!(healed.contains("\"schemaVersion\": 1"));
 }
+
+#[test]
+fn usage_item_carries_the_same_pace_as_the_cli() {
+    use crate::core::{
+        ProviderFetchResult, ProviderId, RateWindow, SESSION_WINDOW_MINUTES, UsageSnapshot,
+        WEEKLY_WINDOW_MINUTES,
+    };
+
+    let window = |used_percent: f64, minutes: u32| RateWindow {
+        used_percent,
+        window_minutes: Some(minutes),
+        // Half of the window has passed, so the expected usage is about 50 %.
+        resets_at: Some(chrono::Utc::now() + chrono::Duration::minutes(i64::from(minutes / 2))),
+        reset_description: None,
+        is_informational: false,
+    };
+    let usage = UsageSnapshot::new(window(20.0, SESSION_WINDOW_MINUTES))
+        .with_secondary(window(80.0, WEEKLY_WINDOW_MINUTES));
+    let item = crate::cli::usage::render_json_result(
+        ProviderId::Claude,
+        ProviderFetchResult::new(usage, "oauth"),
+        None,
+    );
+
+    assert_eq!(item["provider"], "claude");
+    assert_eq!(item["source"], "oauth");
+    assert!(item.get("status").is_none());
+    for lane in ["primary", "secondary"] {
+        let pace = &item["pace"][lane];
+        for key in ["stage", "deltaPercent", "expectedUsedPercent", "willLastToReset"] {
+            assert!(pace.get(key).is_some(), "pace.{lane}.{key} is missing");
+        }
+    }
+    assert_eq!(item["pace"]["primary"]["stage"], "farbehind");
+    assert_eq!(item["pace"]["secondary"]["stage"], "farahead");
+}

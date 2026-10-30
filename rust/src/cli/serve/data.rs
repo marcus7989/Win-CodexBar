@@ -6,7 +6,7 @@
 
 use serde_json::json;
 
-use crate::cli::usage::ProviderSelection;
+use crate::cli::usage::{ProviderSelection, render_json_result};
 use crate::core::{CostScanOptions, FetchContext, ProviderId, SourceMode, instantiate_provider};
 use crate::cost_scanner::{self, CostScanner};
 
@@ -51,12 +51,7 @@ pub async fn usage_response(provider: Option<&str>, source: Option<&str>) -> Str
     for provider_id in selection.as_list() {
         let provider = instantiate_provider(provider_id);
         match provider.fetch_usage(&ctx).await {
-            Ok(result) => results.push(json!({
-                "provider": provider_id.cli_name(),
-                "source": result.source_label,
-                "usage": result.usage,
-                "cost": result.cost,
-            })),
+            Ok(result) => results.push(render_json_result(provider_id, result, None)),
             Err(error) => results.push(json!({
                 "provider": provider_id.cli_name(),
                 "error": error.to_string(),
