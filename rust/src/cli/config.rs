@@ -41,6 +41,15 @@ pub enum ConfigCommand {
         /// Provider CLI name or alias
         provider: String,
     },
+    /// Sign in to a provider
+    Login {
+        /// Provider CLI name
+        #[arg(long)]
+        provider: String,
+        /// Emit machine-readable device authorization details
+        #[arg(long)]
+        json: bool,
+    },
     /// Store an API key for a provider
     SetApiKey {
         /// Provider CLI name or alias
@@ -70,6 +79,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
         ConfigCommand::Providers => list_providers().await,
         ConfigCommand::Enable { provider } => set_provider_enabled(&provider, true).await,
         ConfigCommand::Disable { provider } => set_provider_enabled(&provider, false).await,
+        ConfigCommand::Login { provider, json } => login(&provider, json).await,
         ConfigCommand::SetApiKey {
             provider,
             api_key,
@@ -78,6 +88,87 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
         } => set_api_key(&provider, api_key.as_deref(), stdin, !no_enable).await,
         ConfigCommand::Path => show_paths().await,
     }
+}
+
+async fn login(provider: &str, json: bool) -> anyhow::Result<()> {
+    if parse_provider(provider)? != ProviderId::Copilot {
+        anyhow::bail!("Device login is only supported for copilot.");
+    }
+    if !cfg!(windows) {
+        anyhow::bail!("Copilot login requires Windows protected token storage.");
+    }
+    let flow = crate::providers::copilot::device_flow::CopilotDeviceFlow::new();
+    let device = flow.request_device_code().await?;
+    write_device_code(&mut std::io::stdout().lock(), &device, json)?;
+    let token = flow
+        .wait_for_token(&device.device_code, device.interval, device.expires_in)
+        .await?;
+    let identity = crate::providers::copilot::CopilotApi::new()
+        .fetch_identity_with_token(&token, None)
+        .await;
+    store_copilot_token(&TokenAccountStore::new(), token, identity)?;
+    Ok(())
+}
+
+fn write_device_code(
+    out: &mut impl std::io::Write,
+    device: &crate::providers::copilot::device_flow::DeviceCodeResponse,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({
+                "verificationURI": device.verification_uri,
+                "userCode": device.user_code,
+                "expiresIn": device.expires_in,
+                "status": "authorization_pending"
+            })
+        )?;
+    } else {
+        writeln!(
+            out,
+            "Visit {} and enter code {}.",
+            device.verification_uri, device.user_code
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn store_copilot_token(
+    store: &TokenAccountStore,
+    token: String,
+    identity: Result<crate::providers::copilot::GitHubIdentity, crate::core::ProviderError>,
+) -> anyhow::Result<()> {
+    let identity = identity.map_err(|_| {
+        anyhow::anyhow!("Could not retrieve your GitHub identity. Please try signing in again.")
+    })?;
+    let id = identity.id.ok_or_else(|| {
+        anyhow::anyhow!("GitHub did not provide an account ID. Please try signing in again.")
+    })?;
+    let mut data = store.load_provider(ProviderId::Copilot)?;
+    let identifier = Some(format!("github:user:{id}"));
+    let label = identity.login;
+    if let Some(index) = identifier.as_ref().and_then(|id| {
+        data.accounts
+            .iter()
+            .position(|a| a.external_identifier.as_ref() == Some(id))
+    }) {
+        data.accounts[index].token = token;
+        data.accounts[index].label = label;
+        data.accounts[index].mark_used();
+        data.set_active(index);
+    } else {
+        let mut account = crate::core::TokenAccount::new(label, token);
+        account.external_identifier = identifier;
+        account.mark_used();
+        data.add_account(account);
+        data.set_active(data.accounts.len() - 1);
+    }
+    store.save_provider(ProviderId::Copilot, &data)?;
+    Ok(())
 }
 
 /// Validate configuration files
@@ -483,6 +574,122 @@ mod tests {
     use crate::secure_file;
     use crate::settings::ManualCookies;
     use serde_json::json;
+
+    #[test]
+    fn device_json_matches_mac_contract_and_hides_device_code() {
+        let device = crate::providers::copilot::device_flow::DeviceCodeResponse {
+            device_code: "secret-device-code".into(),
+            user_code: "ABCD-1234".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            verification_uri_complete: None,
+            expires_in: 900,
+            interval: 5,
+        };
+        let mut output = Vec::new();
+        super::write_device_code(&mut output, &device, true).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            json!({
+                "verificationURI": "https://github.com/login/device", "userCode": "ABCD-1234",
+                "expiresIn": 900, "status": "authorization_pending"
+            })
+        );
+        assert!(!output.contains("secret-device-code"));
+    }
+
+    #[test]
+    fn login_persists_and_activates_account_without_losing_other_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::core::TokenAccountStore::with_path(dir.path().join("accounts.json"));
+        let mut other = crate::core::ProviderAccountData::new();
+        other.add_account(crate::core::TokenAccount::new("Other", "other-token"));
+        store
+            .save_provider(crate::core::ProviderId::OpenRouter, &other)
+            .unwrap();
+        let identity = || {
+            Ok(crate::providers::copilot::GitHubIdentity {
+                login: "test-user".into(),
+                id: Some(42),
+                name: None,
+            })
+        };
+        super::store_copilot_token(&store, "first-token".into(), identity()).unwrap();
+        super::store_copilot_token(&store, "second-token".into(), identity()).unwrap();
+        let data = store
+            .load_provider(crate::core::ProviderId::Copilot)
+            .unwrap();
+        assert_eq!(data.accounts.len(), 1);
+        assert_eq!(data.active_account().unwrap().token, "second-token");
+        assert_eq!(
+            data.active_account()
+                .unwrap()
+                .external_identifier
+                .as_deref(),
+            Some("github:user:42")
+        );
+        assert_eq!(
+            store
+                .load_provider(crate::core::ProviderId::OpenRouter)
+                .unwrap()
+                .active_account()
+                .unwrap()
+                .token,
+            "other-token"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn copilot_login_rejects_unprotected_platform_before_network_access() {
+        let error = super::login("copilot", true).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires Windows protected token storage")
+        );
+    }
+
+    #[test]
+    fn failed_or_incomplete_identity_does_not_store_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.json");
+        let store = crate::core::TokenAccountStore::with_path(path.clone());
+        let failed = Err(crate::core::ProviderError::AuthRequired);
+        let error = super::store_copilot_token(&store, "token".into(), failed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Could not retrieve your GitHub identity")
+        );
+        let missing_id = Ok(crate::providers::copilot::GitHubIdentity {
+            login: "test-user".into(),
+            id: None,
+            name: None,
+        });
+        let error = super::store_copilot_token(&store, "token".into(), missing_id).unwrap_err();
+        assert!(error.to_string().contains("did not provide an account ID"));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn login_rejects_other_providers_before_network_access() {
+        assert!(
+            super::login("claude", true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("only supported for copilot")
+        );
+        assert!(
+            super::login("not-a-provider", true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown provider")
+        );
+    }
 
     #[cfg(windows)]
     #[test]

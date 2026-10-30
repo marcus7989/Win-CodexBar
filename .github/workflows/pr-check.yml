@@ -21,7 +21,7 @@ jobs:
     # Reserve reliability over theoretical savings: this repo has a proven
     # Blacksmith 4-vCPU Windows path; a 2-vCPU dispatch queued instead of
     # provisioning during the 2026-09-05 audit. Keep reserve CI dependable.
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-latest
     timeout-minutes: 25
 
     steps:
