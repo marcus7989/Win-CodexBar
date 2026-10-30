@@ -1,0 +1,61 @@
+[
+  {
+    "provider": "codex",
+    "source": "oauth",
+    "usage": {
+      "primary": null,
+      "secondary": {
+        "resetDescription": "Sep 26 at 10:15 AM",
+        "resetsAt": "2026-09-26T08:15:28Z",
+        "usedPercent": 43,
+        "windowMinutes": 10080
+      },
+      "updatedAt": "2026-09-21T08:30:18Z"
+    },
+    "pace": {
+      "secondary": {
+        "deltaPercent": 14,
+        "etaSeconds": 230241,
+        "expectedUsedPercent": 29,
+        "stage": "farAhead",
+        "summary": "14% in deficit | Expected 29% used | Runs out in 2d 15h",
+        "willLastToReset": false
+      }
+    }
+  },
+  {
+    "provider": "claude",
+    "source": "web",
+    "usage": {
+      "primary": {
+        "resetDescription": "Sep 21 at 1:50PM",
+        "resetsAt": "2026-09-21T11:50:00Z",
+        "usedPercent": 8,
+        "windowMinutes": 300
+      },
+      "secondary": {
+        "resetDescription": "Sep 22 at 1:00PM",
+        "resetsAt": "2026-09-22T11:00:00Z",
+        "usedPercent": 73,
+        "windowMinutes": 10080
+      },
+      "updatedAt": "2026-09-21T08:30:19Z"
+    },
+    "pace": {
+      "primary": {
+        "deltaPercent": -25,
+        "expectedUsedPercent": 33,
+        "stage": "farBehind",
+        "summary": "25% in reserve | Expected 33% used | Lasts until reset",
+        "willLastToReset": true
+      },
+      "secondary": {
+        "deltaPercent": -11,
+        "expectedUsedPercent": 84,
+        "stage": "behind",
+        "summary": "11% in reserve | Expected 84% used | Lasts until reset",
+        "willLastToReset": true
+      }
+    }
+  }
+]
