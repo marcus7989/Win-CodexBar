@@ -347,8 +347,7 @@ mod tests {
         std::fs::write(session.join("unrelated-file"), b"preserve").unwrap();
         let script = format!(
             r#"
-# Match the restart script: Windows may expand an 8.3 temp path here.
-$fixturePackage = [System.IO.Path]::GetFullPath({package})
+$fixturePackage = {package}
 $script:stopped = $false
 function Get-AppxPackage {{ [pscustomobject]@{{ InstallLocation = $fixturePackage; Version = '1.0' }} }}
 function Get-CimInstance {{
@@ -390,12 +389,8 @@ if (-not $script:stopped -or -not $script:launched) {{ throw 'Restart did not co
             .unwrap();
         assert!(
             output.status.success(),
-            "exit={:?} stdout={} stderr={} fixture_log={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-            std::fs::read_to_string(dir.path().join("support/codex-desktop-restart.log"))
-                .unwrap_or_default()
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
         assert!(!session.join("Local Storage").exists());
         assert!(!session.join("Preferences").exists());
