@@ -94,6 +94,9 @@ async fn login(provider: &str, json: bool) -> anyhow::Result<()> {
     if parse_provider(provider)? != ProviderId::Copilot {
         anyhow::bail!("Device login is only supported for copilot.");
     }
+    if !cfg!(windows) {
+        anyhow::bail!("Copilot login requires Windows protected token storage.");
+    }
     let flow = crate::providers::copilot::device_flow::CopilotDeviceFlow::new();
     let device = flow.request_device_code().await?;
     write_device_code(&mut std::io::stdout().lock(), &device, json)?;
@@ -102,8 +105,7 @@ async fn login(provider: &str, json: bool) -> anyhow::Result<()> {
         .await?;
     let identity = crate::providers::copilot::CopilotApi::new()
         .fetch_identity_with_token(&token, None)
-        .await
-        .ok();
+        .await;
     store_copilot_token(&TokenAccountStore::new(), token, identity)?;
     Ok(())
 }
@@ -138,16 +140,17 @@ fn write_device_code(
 fn store_copilot_token(
     store: &TokenAccountStore,
     token: String,
-    identity: Option<crate::providers::copilot::GitHubIdentity>,
+    identity: Result<crate::providers::copilot::GitHubIdentity, crate::core::ProviderError>,
 ) -> anyhow::Result<()> {
+    let identity = identity.map_err(|_| {
+        anyhow::anyhow!("Could not retrieve your GitHub identity. Please try signing in again.")
+    })?;
+    let id = identity.id.ok_or_else(|| {
+        anyhow::anyhow!("GitHub did not provide an account ID. Please try signing in again.")
+    })?;
     let mut data = store.load_provider(ProviderId::Copilot)?;
-    let identifier = identity
-        .as_ref()
-        .and_then(|i| i.id)
-        .map(|id| format!("github:user:{id}"));
-    let label = identity
-        .map(|i| i.login)
-        .unwrap_or_else(|| "GitHub Copilot".to_string());
+    let identifier = Some(format!("github:user:{id}"));
+    let label = identity.login;
     if let Some(index) = identifier.as_ref().and_then(|id| {
         data.accounts
             .iter()
@@ -606,7 +609,7 @@ mod tests {
             .save_provider(crate::core::ProviderId::OpenRouter, &other)
             .unwrap();
         let identity = || {
-            Some(crate::providers::copilot::GitHubIdentity {
+            Ok(crate::providers::copilot::GitHubIdentity {
                 login: "test-user".into(),
                 id: Some(42),
                 name: None,
@@ -635,6 +638,39 @@ mod tests {
                 .token,
             "other-token"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn copilot_login_rejects_unprotected_platform_before_network_access() {
+        let error = super::login("copilot", true).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires Windows protected token storage")
+        );
+    }
+
+    #[test]
+    fn failed_or_incomplete_identity_does_not_store_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.json");
+        let store = crate::core::TokenAccountStore::with_path(path.clone());
+        let failed = Err(crate::core::ProviderError::AuthRequired);
+        let error = super::store_copilot_token(&store, "token".into(), failed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Could not retrieve your GitHub identity")
+        );
+        let missing_id = Ok(crate::providers::copilot::GitHubIdentity {
+            login: "test-user".into(),
+            id: None,
+            name: None,
+        });
+        let error = super::store_copilot_token(&store, "token".into(), missing_id).unwrap_err();
+        assert!(error.to_string().contains("did not provide an account ID"));
+        assert!(!path.exists());
     }
 
     #[tokio::test]
