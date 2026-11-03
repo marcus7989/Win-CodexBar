@@ -28,7 +28,7 @@ use crate::cli::error_kind::{
     ERROR_KIND_TIMEOUT, ERROR_KIND_UNKNOWN, error_row, provider_error_row,
 };
 use crate::cli::fetch_context::populate_api_region_from_settings;
-use crate::cli::usage::ProviderSelection;
+use crate::cli::usage::{ProviderSelection, render_json_result};
 use crate::core::{CostScanOptions, FetchContext, ProviderId, instantiate_provider};
 use crate::cost_reporting_period::CostReportingPeriod;
 use crate::cost_scanner::{self, CostScanner};
@@ -135,6 +135,7 @@ pub(super) async fn usage_response(
         ..FetchContext::default()
     };
 
+    let pace_work_days = settings.weekly_progress_work_days;
     let rows = collect_usage_rows(
         selection.as_list(),
         budget.usage_provider_deadline(),
@@ -142,23 +143,23 @@ pub(super) async fn usage_response(
         |provider_id| {
             let mut provider_ctx = ctx.clone();
             populate_api_region_from_settings(provider_id, &settings, &mut provider_ctx);
-            fetch_usage_row(provider_id, provider_ctx)
+            fetch_usage_row(provider_id, provider_ctx, pace_work_days)
         },
     )
     .await;
     json_response(200, Value::Array(rows))
 }
 
-/// One provider's `/usage` row.
-async fn fetch_usage_row(provider_id: ProviderId, ctx: FetchContext) -> Value {
+/// One provider's `/usage` row, built like `codexbar usage --json` so both
+/// carry the same `pace` object.
+async fn fetch_usage_row(
+    provider_id: ProviderId,
+    ctx: FetchContext,
+    pace_work_days: Option<u8>,
+) -> Value {
     let provider = instantiate_provider(provider_id);
     match provider.fetch_usage(&ctx).await {
-        Ok(result) => json!({
-            "provider": provider_id.cli_name(),
-            "source": result.source_label,
-            "usage": result.usage,
-            "cost": result.cost,
-        }),
+        Ok(result) => render_json_result(provider_id, result, None, pace_work_days),
         Err(error) => provider_error_row(provider.as_ref(), &error),
     }
 }

@@ -18,7 +18,7 @@ pub(super) use render::{
     append_status_line, format_percent, render_status_indicator, render_text_error,
 };
 use render::{is_terminal, print_usage_output};
-pub use render::{render_brief_text, render_text_with_status};
+pub use render::{render_brief_text, render_json_result, render_text_with_status};
 
 pub(super) enum UsageOutput {
     Text(Vec<String>),
