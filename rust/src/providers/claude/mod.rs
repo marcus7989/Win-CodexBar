@@ -493,8 +493,13 @@ impl ClaudeProvider {
             }
         }
 
-        if let Some(result) =
-            record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)?
+        // The browser can be signed in to another claude.ai account than
+        // Claude Code, and its numbers then belong to that account (see
+        // `claude_code_answers_first`).
+        let claude_code_signed_in = claude_code_answers_first(ctx, oauth::has_stored_credentials());
+        if !claude_code_signed_in
+            && let Some(result) =
+                record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)?
         {
             return Ok(live_auto_success(result));
         }
@@ -536,6 +541,13 @@ impl ClaudeProvider {
                 cache_cli_result(result.clone());
             }
             return Ok(result);
+        }
+
+        if claude_code_signed_in
+            && let Some(result) =
+                record_auto_source(&mut failures, "Web", self.fetch_via_web(ctx).await)?
+        {
+            return Ok(live_auto_success(result));
         }
 
         // Upstream 0.50.1 #2516: when all live sources fail, keep the
@@ -803,6 +815,18 @@ fn stale_cli_result_on_probe_timeout(
         Err(error) if error.is_transport_failure() => cached_cli_result(),
         _ => None,
     }
+}
+
+/// Whether Claude Code's login and its /usage screen answer before the browser
+/// in Auto. While Claude Code is signed in (a stored login or a token in the
+/// context) they do, and the browser is the last live source: it can be signed
+/// in to a second claude.ai account. Without a Claude Code login the CLI cannot
+/// answer either, so the browser keeps its place before it. A cookie handed in
+/// by the caller (a token account, the Manual source) is the account asked for
+/// and always reads claude.ai first.
+fn claude_code_answers_first(ctx: &FetchContext, stored_login: bool) -> bool {
+    ctx.manual_cookie_header.is_none()
+        && (stored_login || ctx.api_key.as_deref().is_some_and(|t| !t.trim().is_empty()))
 }
 
 fn claude_auto_fetch_error(failures: Vec<(&'static str, ProviderError)>) -> ProviderError {

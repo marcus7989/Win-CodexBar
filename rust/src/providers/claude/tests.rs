@@ -847,6 +847,21 @@ fn cli_auth_error_does_not_fallback_to_oauth() {
 }
 
 #[test]
+fn claude_code_answers_before_the_browser_unless_a_cookie_was_asked_for() {
+    let ctx = |api_key: Option<&str>, cookie: Option<&str>| FetchContext {
+        api_key: api_key.map(str::to_string),
+        manual_cookie_header: cookie.map(str::to_string),
+        ..FetchContext::default()
+    };
+    assert!(claude_code_answers_first(&ctx(None, None), true));
+    assert!(claude_code_answers_first(&ctx(Some("token"), None), false));
+    assert!(!claude_code_answers_first(&ctx(Some(" "), None), false));
+    assert!(!claude_code_answers_first(&ctx(None, None), false));
+    // A token account's cookie is its own account, whatever Claude Code holds.
+    assert!(!claude_code_answers_first(&ctx(None, Some("sessionKey=x")), true));
+}
+
+#[test]
 fn auto_fetch_error_keeps_all_source_failures() {
     let err = claude_auto_fetch_error(vec![
         ("OAuth", ProviderError::OAuth("token expired".to_string())),
