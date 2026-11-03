@@ -27,7 +27,7 @@ use crate::cli::cost_period::{cost_totals_json, rolling_window_days, stamp_perio
 use crate::cli::error_kind::{
     ERROR_KIND_TIMEOUT, ERROR_KIND_UNKNOWN, error_row, provider_error_row,
 };
-use crate::cli::fetch_context::populate_api_region_from_settings;
+use crate::cli::usage::apply_stored_credentials;
 use crate::cli::usage::{ProviderSelection, render_json_result};
 use crate::core::{CostScanOptions, FetchContext, ProviderId, instantiate_provider};
 use crate::cost_reporting_period::CostReportingPeriod;
@@ -142,7 +142,9 @@ pub(super) async fn usage_response(
         &operations.usage,
         |provider_id| {
             let mut provider_ctx = ctx.clone();
-            populate_api_region_from_settings(provider_id, &settings, &mut provider_ctx);
+            if let Err(error) = apply_stored_credentials(provider_id, None, &mut provider_ctx) {
+                tracing::warn!(provider = provider_id.cli_name(), %error, "stored credentials unavailable");
+            }
             fetch_usage_row(provider_id, provider_ctx, pace_work_days)
         },
     )

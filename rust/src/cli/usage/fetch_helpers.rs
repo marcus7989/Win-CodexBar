@@ -162,11 +162,7 @@ pub async fn fetch_provider_result(
         .fetch_status
         .then(|| fetch_provider_status(provider_id));
     let mut ctx = command.ctx.clone();
-    let account_projected = project_cli_account(provider_id, command.account.as_deref(), &mut ctx)?;
-    populate_api_region_from_settings(provider_id, &Settings::load(), &mut ctx);
-    if !account_projected && ctx.api_key.is_none() {
-        ctx.api_key = resolve_cli_api_key(provider_id, command.account.as_deref())?;
-    }
+    apply_stored_credentials(provider_id, command.account.as_deref(), &mut ctx)?;
     let mut result = provider.fetch_usage(&ctx).await?;
     result.source_label.push_str(source_label_suffix);
     let status = if let Some(fut) = status_future {
@@ -175,6 +171,22 @@ pub async fn fetch_provider_result(
         None
     };
     Ok((result, status))
+}
+
+/// The token account and stored key a provider's fetch runs with. `usage` and
+/// `serve` `/usage` both call this, so a login saved by `config login` (Copilot)
+/// or an API key reaches the provider on either path.
+pub(crate) fn apply_stored_credentials(
+    provider_id: ProviderId,
+    account_ref: Option<&str>,
+    ctx: &mut crate::core::FetchContext,
+) -> anyhow::Result<()> {
+    let account_projected = project_cli_account(provider_id, account_ref, ctx)?;
+    populate_api_region_from_settings(provider_id, &Settings::load(), ctx);
+    if !account_projected && ctx.api_key.is_none() {
+        ctx.api_key = resolve_cli_api_key(provider_id, account_ref)?;
+    }
+    Ok(())
 }
 
 /// Apply the selected labeled account to the same route used by the desktop
