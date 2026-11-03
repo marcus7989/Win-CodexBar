@@ -1,0 +1,66 @@
+name: VibeTV CLI test build
+
+# Unsigned console CLI for VibeTV's Windows rehearsal. Builds the CLI only
+# (no desktop app, no SignPath, no release), checks the executable the way
+# the release pipeline does and keeps the zip as a workflow artifact.
+on:
+  push:
+    branches:
+      - vibetv-on-nesszer-main-0311
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --manifest-path rust/Cargo.toml --release --bin codexbar --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed: $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/codexbar.exe dist/codexbar-cli.exe
+
+      - name: Check the executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . scripts/release-pipeline-common.ps1
+          $dynamic = @(Get-DynamicCrtImports (Get-PeImportedDllNames (Resolve-Path dist/codexbar-cli.exe)))
+          if ($dynamic.Count -gt 0) { throw "codexbar-cli.exe links the C runtime dynamically: $($dynamic -join ', ')" }
+          $serve = (& dist/codexbar-cli.exe serve --help) -join "`n"
+          if ($serve -notmatch '--all-accounts') { throw 'serve --help lacks --all-accounts' }
+          $login = (& dist/codexbar-cli.exe config login --help) -join "`n"
+          if ($login -notmatch 'copilot') { throw 'config login --help does not name copilot' }
+          & dist/codexbar-cli.exe --version
+
+      - name: Zip and hash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "CodexBarCLI-${env:GITHUB_SHA}-windows-x64.zip"
+          Compress-Archive -Path dist/codexbar-cli.exe -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+          Write-Host "sha256 $hash  $zip  (commit $env:GITHUB_SHA)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codexbar-cli-windows-x64
+          path: |
+            CodexBarCLI-*.zip
+            CodexBarCLI-*.zip.sha256
+          retention-days: 30
