@@ -45,6 +45,9 @@ jobs:
           if ($serve -notmatch '--all-accounts') { throw 'serve --help lacks --all-accounts' }
           $login = (& dist/codexbar-cli.exe config login --help) -join "`n"
           if ($login -notmatch 'copilot') { throw 'config login --help does not name copilot' }
+          $providers = (& dist/codexbar-cli.exe config providers --json) -join "`n" | ConvertFrom-Json
+          if (-not ($providers | Where-Object { $_.provider -eq 'openrouter' -and $_.authentication.supportsConfigAPIKey -eq $true })) { throw 'config providers --json lacks authentication.supportsConfigAPIKey for openrouter' }
+          if ($providers | Where-Object { $_.provider -eq 'codex' -and $_.authentication.supportsConfigAPIKey -ne $false }) { throw 'config providers --json: codex must not support a config API key' }
           & dist/codexbar-cli.exe --version
 
       - name: Zip and hash
