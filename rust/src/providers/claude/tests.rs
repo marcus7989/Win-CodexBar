@@ -326,6 +326,30 @@ fn parse_err(output: &str) -> ProviderError {
         .expect_err("should reject")
 }
 
+/// Plans without a 5-hour limit print no "Current session" row. The first
+/// percentage on the panel is then the weekly one and must not become the
+/// session (VibeTV-shop/vibetv#614, upstream steipete/CodexBar#4914).
+#[test]
+fn weekly_only_cli_screen_keeps_session_empty() {
+    let usage = parse_ok(
+        r#"
+Status   Config   Usage
+
+  Current week (all models)
+  ████                                               8% used
+  Resets Nov 9 at 9am (America/New_York)
+
+  Current week (Fable only)
+  ▌                                                  0% used
+  Resets Nov 9 at 9am (America/New_York)
+"#,
+    )
+    .usage;
+    assert!(usage.primary.is_informational);
+    assert_eq!(usage.primary.used_percent, 0.0);
+    assert_eq!(usage.secondary.map(|w| w.used_percent), Some(8.0));
+}
+
 #[test]
 fn parses_current_cli_usage_screen() {
     let output = r#"
