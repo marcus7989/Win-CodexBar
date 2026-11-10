@@ -682,7 +682,11 @@ impl ClaudeProvider {
 
         // Fallback: collect all percentages in order. Activity stats carry
         // their own percentages, which must never be read as plan limits.
-        if session_percent.is_none() && !activity_stats {
+        // Without a "Current session" row (weekly-only plans) the first
+        // percentage belongs to a weekly window, so there is no fallback
+        // (upstream steipete/CodexBar#4914).
+        if session_percent.is_none() && !activity_stats && clean_lower.contains("current session")
+        {
             let all_percents: Vec<f64> = percent_matches(&clean).collect();
             if !all_percents.is_empty() {
                 session_percent = Some(all_percents[0]);
@@ -727,15 +731,17 @@ impl ClaudeProvider {
         }
 
         // Build usage snapshot
-        let session_used = session_percent.unwrap_or(0.0);
-        let primary = RateWindow::with_details(
-            session_used,
-            Some(300), // 5 hour session window
-            session_reset
-                .as_deref()
-                .and_then(|reset| parse_claude_reset_date(reset, now, Some(300))),
-            session_reset,
-        );
+        let primary = match session_percent {
+            Some(session_used) => RateWindow::with_details(
+                session_used,
+                Some(300), // 5 hour session window
+                session_reset
+                    .as_deref()
+                    .and_then(|reset| parse_claude_reset_date(reset, now, Some(300))),
+                session_reset,
+            ),
+            None => RateWindow::no_active_session(),
+        };
 
         let mut usage = UsageSnapshot::new(primary);
 
