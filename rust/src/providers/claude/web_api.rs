@@ -404,17 +404,6 @@ impl ClaudeWebApiFetcher {
         clear: impl FnOnce(),
         no_session_error: impl FnOnce(&I) -> ProviderError,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        // A challenge is a network-path failure, not evidence that a cached
-        // session is invalid. Keep the last validated cookie for the next
-        // refresh and only invalidate it for an ordinary auth response.
-        if let Some(cached) = cached {
-            match self.fetch_with_cookie_header(&cached).await {
-                Ok(result) => return Ok(result),
-                Err(error) if is_cookie_authentication_failure(&error) => clear(),
-                Err(error) => return Err(error),
-            }
-        }
-
         // A signed-out browser session moves on to the next browser's session.
         let mut rejected = None;
         for cookie_header in sessions.by_ref() {
@@ -427,7 +416,22 @@ impl ClaudeWebApiFetcher {
                 Err(error) => return Err(error),
             }
         }
-        Err(rejected.unwrap_or_else(|| no_session_error(sessions)))
+        if let Some(error) = rejected {
+            return Err(error);
+        }
+        let Some(cached) = cached else {
+            return Err(no_session_error(sessions));
+        };
+        // A challenge is a network-path failure, not evidence that the saved
+        // session is invalid: keep it and only drop it for an ordinary auth
+        // response.
+        match self.fetch_with_cookie_header(&cached).await {
+            Err(error) if is_cookie_authentication_failure(&error) => {
+                clear();
+                Err(error)
+            }
+            other => other,
+        }
     }
 
     /// Fetch usage with a provided cookie header
