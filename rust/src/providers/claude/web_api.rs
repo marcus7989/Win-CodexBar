@@ -370,38 +370,64 @@ impl ClaudeWebApiFetcher {
             "anthropic.com",
         ];
 
+        use crate::browser::cookie_cache::CookieHeaderCache;
+        let mut sessions = crate::providers::unscoped_browser_cookie_sessions(&domains);
+        let cached = CookieHeaderCache::load(crate::core::ProviderId::Claude)
+            .map(|entry| entry.cookie_header);
+        self.fetch_live_session_first(
+            &mut sessions,
+            cached,
+            |cookie_header| {
+                let _stored = CookieHeaderCache::store(
+                    crate::core::ProviderId::Claude,
+                    cookie_header,
+                    "browser",
+                );
+            },
+            || CookieHeaderCache::clear(crate::core::ProviderId::Claude),
+            |sessions| sessions.exhaustion_error(),
+        )
+        .await
+    }
+
+    /// The session the browser holds right now wins over the saved one: it
+    /// carries the account and `lastActiveOrg` the user works in today, while
+    /// the saved header stays valid for claude.ai long after the user switched
+    /// account or organization. The saved header is only the fallback for a
+    /// browser that cannot be read (locked or encrypted cookie store, no
+    /// browser), so reading the browser never needs to succeed.
+    async fn fetch_live_session_first<I: Iterator<Item = String>>(
+        &self,
+        sessions: &mut I,
+        cached: Option<String>,
+        store: impl FnOnce(&str),
+        clear: impl FnOnce(),
+        no_session_error: impl FnOnce(&I) -> ProviderError,
+    ) -> Result<ProviderFetchResult, ProviderError> {
         // A challenge is a network-path failure, not evidence that a cached
         // session is invalid. Keep the last validated cookie for the next
         // refresh and only invalidate it for an ordinary auth response.
-        use crate::browser::cookie_cache::CookieHeaderCache;
-        if let Some(cached) = CookieHeaderCache::load(crate::core::ProviderId::Claude) {
-            match self.fetch_with_cookie_header(&cached.cookie_header).await {
+        if let Some(cached) = cached {
+            match self.fetch_with_cookie_header(&cached).await {
                 Ok(result) => return Ok(result),
-                Err(error) if is_cookie_authentication_failure(&error) => {
-                    CookieHeaderCache::clear(crate::core::ProviderId::Claude);
-                }
+                Err(error) if is_cookie_authentication_failure(&error) => clear(),
                 Err(error) => return Err(error),
             }
         }
 
         // A signed-out browser session moves on to the next browser's session.
-        let mut sessions = crate::providers::unscoped_browser_cookie_sessions(&domains);
         let mut rejected = None;
         for cookie_header in sessions.by_ref() {
             match self.fetch_with_cookie_header(&cookie_header).await {
                 Ok(result) => {
-                    let _stored = CookieHeaderCache::store(
-                        crate::core::ProviderId::Claude,
-                        &cookie_header,
-                        "browser",
-                    );
+                    store(&cookie_header);
                     return Ok(result);
                 }
                 Err(error) if is_cookie_authentication_failure(&error) => rejected = Some(error),
                 Err(error) => return Err(error),
             }
         }
-        Err(rejected.unwrap_or_else(|| sessions.exhaustion_error()))
+        Err(rejected.unwrap_or_else(|| no_session_error(sessions)))
     }
 
     /// Fetch usage with a provided cookie header
@@ -973,3 +999,7 @@ mod reset_opt_in_tests;
 #[cfg(test)]
 #[path = "subscription_details_wire_tests.rs"]
 mod subscription_details_wire_tests;
+
+#[cfg(test)]
+#[path = "live_session_tests.rs"]
+mod live_session_tests;
