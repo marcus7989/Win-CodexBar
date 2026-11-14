@@ -357,14 +357,12 @@ impl OllamaProvider {
             ));
         }
 
-        // A wallet-only page reports no quota: keep the primary lane informational
-        // and hidden so no fake 0% meter is drawn (same as the API path).
+        // A wallet-only or weekly-only page reports no primary quota: keep the
+        // primary lane informational and hidden so no fake 0% meter is drawn
+        // (same as the API path).
         let primary = match monthly_block.as_ref().or(session_block.as_ref()) {
-            Some(block) => rate_window_from_usage_block(Some(block)),
-            None if wallet_balance.is_some() => {
-                RateWindow::informational("No quota reported").hidden_on_card()
-            }
-            None => rate_window_from_usage_block(None),
+            Some(block) => rate_window_from_usage_block(block),
+            None => RateWindow::informational("No quota reported").hidden_on_card(),
         };
         let mut usage = UsageSnapshot::new(primary);
         if monthly_block.is_some() {
@@ -382,7 +380,7 @@ impl OllamaProvider {
         }
 
         if let Some(weekly) = weekly_block.as_ref() {
-            usage = usage.with_secondary(rate_window_from_usage_block(Some(weekly)));
+            usage = usage.with_secondary(rate_window_from_usage_block(weekly));
         }
 
         Ok(usage)
@@ -623,17 +621,13 @@ fn parse_wallet_amount(raw: &str) -> Option<f64> {
     amount.is_finite().then_some(amount)
 }
 
-fn rate_window_from_usage_block(block: Option<&UsageBlock>) -> RateWindow {
-    block
-        .map(|block| {
-            RateWindow::with_details(
-                block.used_percent,
-                block.window_minutes,
-                block.resets_at,
-                block.reset_description.clone(),
-            )
-        })
-        .unwrap_or_else(|| RateWindow::new(0.0))
+fn rate_window_from_usage_block(block: &UsageBlock) -> RateWindow {
+    RateWindow::with_details(
+        block.used_percent,
+        block.window_minutes,
+        block.resets_at,
+        block.reset_description.clone(),
+    )
 }
 
 fn parse_first_datetime(html: &str) -> Option<DateTime<Utc>> {
@@ -1193,6 +1187,21 @@ mod tests {
           </div>
         </section>
     "#;
+
+    #[test]
+    fn weekly_only_page_keeps_primary_informational_instead_of_zero_percent() {
+        let html = r#"<section>Weekly usage <span>84% used</span><time>2026-06-01T00:00:00Z</time></section>"#;
+        let result = OllamaProvider::new()
+            .parse_usage_result(html)
+            .expect("weekly-only page parses");
+
+        assert!(result.usage.primary.is_informational);
+        assert!(!result.usage.primary.usage_known);
+        assert_eq!(
+            result.usage.secondary.as_ref().map(|w| w.used_percent),
+            Some(84.0)
+        );
+    }
 
     #[test]
     fn credit_wallet_balance_reaches_cost_without_inventing_quota() {

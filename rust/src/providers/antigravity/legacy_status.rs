@@ -377,7 +377,8 @@ fn snapshot_from_model_configs(model_configs: &[ModelConfig]) -> UsageSnapshot {
         .and_then(|config| config.quota_info.as_ref())
         .map(rate_window_from_quota);
 
-    let primary = primary.unwrap_or_else(|| RateWindow::new(0.0));
+    let primary =
+        primary.unwrap_or_else(|| RateWindow::informational(super::remote::LIMITS_NOT_AVAILABLE));
     let mut snapshot = UsageSnapshot::new(primary);
 
     if let Some(sec) = secondary {
@@ -418,4 +419,36 @@ fn snapshot_from_model_configs(model_configs: &[ModelConfig]) -> UsageSnapshot {
     }
 
     snapshot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn no_model_with_quota_info_is_informational_instead_of_zero_percent() {
+        let response: UserStatusResponse = serde_json::from_value(json!({
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [{ "label": "Gemini 3 Pro" }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let snapshot = parse_user_status(response).unwrap();
+
+        assert!(snapshot.primary.is_informational);
+        assert!(!snapshot.primary.usage_known);
+        assert!(snapshot.secondary.is_none());
+    }
+
+    #[test]
+    fn no_model_quotas_is_informational_instead_of_zero_percent() {
+        let snapshot = snapshot_from_model_quotas(&[]);
+
+        assert!(snapshot.primary.is_informational);
+        assert!(!snapshot.primary.usage_known);
+    }
 }
