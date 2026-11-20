@@ -35,7 +35,7 @@ pub(super) const SESSION_EXPIRED_MESSAGE: &str =
     "Antigravity Google sign-in expired. Sign in to it again.";
 pub(super) const REAUTHENTICATION_REQUIRED_MESSAGE: &str = "This Antigravity account was signed in with an OAuth client that cannot read its quota. Sign in to it again.";
 const MISSING_CLIENT_MESSAGE: &str = "Could not discover a matching Antigravity OAuth client. Update or install Antigravity, or set ANTIGRAVITY_OAUTH_CLIENT_ID and ANTIGRAVITY_OAUTH_CLIENT_SECRET.";
-const LIMITS_NOT_AVAILABLE: &str = "Limits not available";
+pub(super) const LIMITS_NOT_AVAILABLE: &str = "Limits not available";
 
 pub(super) const BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
 /// Current quota lives on the daily host; the OAuth quota summary is read there
